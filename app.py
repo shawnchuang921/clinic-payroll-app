@@ -42,10 +42,13 @@ if staff_file and sales_file:
     if st.button("Run Reconciliation"):
         try:
             with st.spinner('Processing records...'):
-                # 1. Load Data - FIX IMPLEMENTED HERE: Added encoding='latin1'
-                df_staff = pd.read_csv(staff_file, encoding='latin1')
-                df_sales = pd.read_csv(sales_file, encoding='latin1')
+                # 1. Load Data - FIX IMPLEMENTED HERE: encoding, engine, and on_bad_lines
+                # Note: If latin1 fails, try encoding='cp1252'
+                df_staff = pd.read_csv(staff_file, encoding='latin1', engine='python', on_bad_lines='skip')
+                df_sales = pd.read_csv(sales_file, encoding='latin1', engine='python', on_bad_lines='skip')
 
+                st.success("Files loaded and problematic rows skipped.")
+                
                 # 2. Preprocessing Sales
                 df_sales = df_sales.dropna(subset=['Patient', 'Invoice Date'])
                 df_sales['dt_obj'] = pd.to_datetime(df_sales['Invoice Date'], utc=True)
@@ -80,7 +83,6 @@ if staff_file and sales_file:
                 merged_df['Amount_Status'] = merged_df.apply(check_amount, axis=1)
 
                 # 6. Final Report Columns
-                # ... (rest of the column filtering and renaming logic) ...
                 desired_cols = ['Date_x', 'extracted_name', 'Notes', 'Charged_Amount',
                                 'Invoice Date', 'Patient', 'Item', 'Subtotal', 'Status', 'Amount_Status']
                 
@@ -91,10 +93,7 @@ if staff_file and sales_file:
 
                 final_report = merged_df[desired_cols].rename(columns=rename_map)
 
-
                 # --- Display Results ---
-                
-                # Metrics
                 st.markdown("### 📊 Reconciliation Summary")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Total Matches", len(final_report[final_report['Status']=='Matched']))

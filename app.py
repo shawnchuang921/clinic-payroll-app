@@ -51,6 +51,10 @@ if staff_file and sales_file:
                 df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
                 df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
                 
+                # 🎯 FINAL TARGETED FIX: Rename the 'date' column in Staff Log
+                # We rename both 'date' and 'Date' to 'date' to ensure consistency.
+                df_staff = df_staff.rename(columns={'date': 'date', 'Date': 'date'}, errors='ignore')
+
                 # 2. Preprocessing Sales
                 # Columns are now lowercase with underscores!
                 df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
@@ -61,7 +65,7 @@ if staff_file and sales_file:
                 df_sales['patient_norm'] = df_sales['patient'].astype(str).str.strip().str.lower()
 
                 # 3. Preprocessing Staff
-                # Columns are now lowercase with underscores! The 'date' column is ready!
+                # Columns are now lowercase with underscores! The 'date' column must now be ready!
                 df_staff['date_obj'] = pd.to_datetime(df_staff['date'])
                 df_staff['date_str'] = df_staff['date_obj'].dt.date.astype(str)
                 df_staff['extracted_name'] = df_staff['notes'].apply(extract_name)
@@ -122,9 +126,10 @@ if staff_file and sales_file:
                 )
 
         except Exception as e:
-            # Display a more user-friendly error message
+            # Display the column error clearly for diagnosis
             st.error(f"An error occurred: {e}")
             st.warning("A critical column is missing or unreadable. Please ensure your CSV files have the correct header names: **Date**, **Notes**, **Charged_Amount**, **Patient**, **Invoice Date**, **Item**, and **Subtotal**.")
 
 else:
     st.info("👋 Please upload both CSV files in the sidebar to begin.")
+

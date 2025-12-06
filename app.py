@@ -9,7 +9,7 @@ st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 st.title("🏥 Clinic Staff vs. Sales Reconciler")
 st.markdown("""
 Upload the **Staff Log** and the **Sales Record** below. 
-The app will match them based on Date and Patient Name, ignoring spaces and punctuation.
+The app will match them based on Date and Patient Name.
 """)
 
 # --- Sidebar: File Uploads ---
@@ -17,7 +17,7 @@ st.sidebar.header("1. Upload Data")
 staff_file = st.sidebar.file_uploader("Upload Staff Log (CSV)", type=['csv'])
 sales_file = st.sidebar.file_uploader("Upload Sales Record (CSV)", type=['csv'])
 
-# --- Helper Functions ---
+# --- Helper Functions (Remaining unchanged) ---
 def clean_name_string(name):
     """Aggressively removes all non-alphabetic characters for reliable fuzzy matching."""
     if not isinstance(name, str): return ""
@@ -55,7 +55,7 @@ if staff_file and sales_file:
                 df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
                 df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
                 
-                # 🎯 Positional Fix (Guarantees 'date' exists as first column)
+                # Positional Fix (Guarantees 'date' exists as first column)
                 if len(df_staff.columns) > 0:
                     df_staff = df_staff.rename(columns={df_staff.columns[0]: 'date'}, errors='ignore')
 
@@ -64,7 +64,7 @@ if staff_file and sales_file:
                 df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], utc=True)
                 df_sales['dt_local'] = df_sales['dt_obj'].dt.tz_convert('America/Vancouver')
                 
-                # 🎯 DATE FIX: Ensure sales merge only on the date component (YYYY-MM-DD)
+                # Date Fix
                 df_sales['date_str'] = df_sales['dt_local'].dt.normalize().astype(str).str[:10]
                 
                 # Fuzzy Matching
@@ -73,14 +73,46 @@ if staff_file and sales_file:
                 # 3. Preprocessing Staff
                 df_staff['date_obj'] = pd.to_datetime(df_staff['date'])
                 
-                # 🎯 DATE FIX: Ensure staff merge only on the date component (YYYY-MM-DD)
+                # Date Fix
                 df_staff['date_str'] = df_staff['date_obj'].dt.normalize().astype(str).str[:10]
                 
                 df_staff['extracted_name'] = df_staff['notes'].apply(extract_name)
                 # Fuzzy Matching
                 df_staff['name_norm'] = df_staff['extracted_name'].apply(clean_name_string)
 
-                # 4. Merging
+                # --- DIAGNOSTIC STEP: SHOWING THE RAW KEYS ---
+                st.markdown("### 🔍 Diagnostic Key Check (Scroll right to see keys)")
+                
+                # Create a sample view for staff
+                staff_diag = df_staff[['date_str', 'name_norm', 'extracted_name', 'notes']].rename(
+                    columns={'date_str': 'Date_Key', 'name_norm': 'Name_Key', 
+                             'extracted_name': 'Staff_Name_Original', 'notes': 'Staff_Notes'})
+                staff_diag['Key_Source'] = 'Staff'
+                
+                # Create a sample view for sales
+                sales_diag = df_sales[['date_str', 'patient_norm', 'patient']].rename(
+                    columns={'date_str': 'Date_Key', 'patient_norm': 'Name_Key', 
+                             'patient': 'Sales_Patient_Original'})
+                sales_diag['Key_Source'] = 'Sales'
+
+                # Combine the relevant columns for visual comparison
+                # Note: We can't easily display them side-by-side without merging first, so we use the raw keys.
+                
+                diag_cols = ['Key_Source', 'Date_Key', 'Name_Key', 'Staff_Name_Original', 'Sales_Patient_Original']
+                
+                # Merge on the comparison keys to see potential matches
+                diag_merged = pd.merge(
+                    staff_diag,
+                    sales_diag,
+                    on=['Date_Key', 'Name_Key'],
+                    how='outer',
+                    indicator='Match_Status'
+                )
+
+                st.dataframe(diag_merged, use_container_width=True)
+                st.markdown("---") # Visual separator before the main report
+
+                # 4. Merging (Original Merge Logic)
                 merged_df = pd.merge(
                     df_staff,
                     df_sales,
@@ -89,7 +121,7 @@ if staff_file and sales_file:
                     how='outer',
                     indicator=True
                 )
-
+                
                 # 5. Labeling and Amount Check 
                 status_map = {
                     'both': 'Matched',

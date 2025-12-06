@@ -17,7 +17,7 @@ st.sidebar.header("1. Upload Data")
 staff_file = st.sidebar.file_uploader("Upload Staff Log (CSV)", type=['csv'])
 sales_file = st.sidebar.file_uploader("Upload Sales Record (CSV)", type=['csv'])
 
-# --- Helper Functions (Remaining unchanged) ---
+# --- Helper Functions ---
 def clean_name_string(name):
     """Aggressively removes all non-alphabetic characters for reliable fuzzy matching."""
     if not isinstance(name, str): return ""
@@ -43,13 +43,10 @@ def check_amount_v2(row):
 def check_date_tolerance(row, tolerance_days=1):
     """Checks if the Staff Date and Sales Invoice Date are within the tolerance."""
     if row['Status'] == 'Matched':
-        # Get the clean, normalized date objects we created earlier
         staff_date = row.get('date_obj')
         sales_date = row.get('dt_obj')
         
-        # Calculate difference (in days)
         if pd.notna(staff_date) and pd.notna(sales_date):
-            # Use the date component of the datetime objects
             diff = abs((staff_date.date() - sales_date.date()).days)
             if diff <= tolerance_days:
                 return f"Match (Diff: {diff} days)"
@@ -73,40 +70,34 @@ if staff_file and sales_file:
                 df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
                 df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
                 
-                # Positional Fix (Guarantees 'date' exists as first column)
+                # Positional Fix
                 if len(df_staff.columns) > 0:
                     df_staff = df_staff.rename(columns={df_staff.columns[0]: 'date'}, errors='ignore')
 
                 # 2. Preprocessing Sales
                 df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
-                # Store the original datetime objects for the new date check
                 df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], utc=True)
                 df_sales['dt_local'] = df_sales['dt_obj'].dt.tz_convert('America/Vancouver')
-                df_sales['date_str'] = df_sales['dt_local'].dt.normalize().astype(str).str[:10] # Kept for display/reference
-                
-                # Fuzzy Matching
+                df_sales['date_str'] = df_sales['dt_local'].dt.normalize().astype(str).str[:10]
                 df_sales['patient_norm'] = df_sales['patient'].apply(clean_name_string) 
 
                 # 3. Preprocessing Staff
-                # Store the original datetime objects for the new date check
                 df_staff['date_obj'] = pd.to_datetime(df_staff['date'])
-                df_staff['date_str'] = df_staff['date_obj'].dt.normalize().astype(str).str[:10] # Kept for display/reference
-                
+                df_staff['date_str'] = df_staff['date_obj'].dt.normalize().astype(str).str[:10]
                 df_staff['extracted_name'] = df_staff['notes'].apply(extract_name)
-                # Fuzzy Matching
                 df_staff['name_norm'] = df_staff['extracted_name'].apply(clean_name_string)
 
-                # 4. Merging - NOW ONLY ON NAME
+                # 4. Merging - NAME ONLY
                 merged_df = pd.merge(
                     df_staff,
                     df_sales,
-                    left_on=['name_norm'], # <-- KEY CHANGE: Removed 'date_str'
-                    right_on=['patient_norm'], # <-- KEY CHANGE: Removed 'date_str'
+                    left_on=['name_norm'],
+                    right_on=['patient_norm'],
                     how='outer',
                     indicator=True
                 )
 
-                # 5. Labeling, Amount, and NEW Date Tolerance Check
+                # 5. Labeling, Amount, and Date Tolerance Check
                 status_map = {
                     'both': 'Matched',
                     'left_only': 'In Staff Log Only (Missing in Sales)',
@@ -114,18 +105,14 @@ if staff_file and sales_file:
                 }
                 merged_df['Status'] = merged_df['_merge'].map(status_map)
                 merged_df['Amount_Status'] = merged_df.apply(check_amount_v2, axis=1)
-                
-                # The NEW column to verify date alignment
                 merged_df['Date_Tolerance_Status'] = merged_df.apply(check_date_tolerance, axis=1)
 
-                # 6. Final Report Columns (Original capitalization for display)
-                # Selecting the merged date for display when available
+                # 6. Final Report Columns
                 merged_df['Display_Date'] = merged_df['date_str_x'].fillna(merged_df['date_str_y'])
                 
-                # Use the clean date string columns for the report, but rename for clarity
                 report_cols = ['Display_Date', 'extracted_name', 'notes', 'charged_amount',
                                'invoice_date', 'patient', 'item', 'subtotal', 
-                               'Status', 'Amount_Status', 'Date_Tolerance_Status'] # NEW COLUMN
+                               'Status', 'Amount_Status', 'Date_Tolerance_Status'] 
 
                 final_report = merged_df[report_cols].rename(columns={
                     'Display_Date': 'Date (Staff Log)', 
@@ -138,18 +125,30 @@ if staff_file and sales_file:
                     'subtotal': 'Subtotal'
                 })
 
-                # Filter the matches for the summary count to only include those with date tolerance
+                # --- NEW ROBUST METRIC CALCULATIONS ---
+                
+                # Metric 1: Matches (within 1 day)
                 matched_count = len(final_report[
                     (final_report['Status'] == 'Matched') & 
-                    (final_report['Date_Tolerance_Status'].str.contains("Match"))
+                    (final_report['Date_Tolerance_Status'].str.contains("Match", na=False))
+                ])
+
+                # Metric 2: Staff Log Only (Exact match on the status string)
+                staff_only_count = len(final_report[
+                    final_report['Status'] == 'In Staff Log Only (Missing in Sales)'
+                ])
+
+                # Metric 3: Sales Record Only (Exact match on the status string)
+                sales_only_count = len(final_report[
+                    final_report['Status'] == 'In Sales Record Only (Missing in Log)'
                 ])
 
                 # --- Display Results and Download Button ---
                 st.markdown("### 📊 Reconciliation Summary")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Total Matches (Within 1 Day)", matched_count)
-                col2.metric("In Staff Log Only", len(final_report[final_report['Status'].str.contains('left_only')]))
-                col3.metric("In Sales Record Only", len(final_report[final_report['Status'].str.contains('right_only')]))
+                col2.metric("In Staff Log Only", staff_only_count)
+                col3.metric("In Sales Record Only", sales_only_count) # NOW CORRECT
 
                 st.markdown("### 📋 Detailed Report")
                 st.dataframe(final_report, use_container_width=True)

@@ -51,9 +51,10 @@ if staff_file and sales_file:
                 df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
                 df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
                 
-                # 🎯 FINAL TARGETED FIX: Rename the 'date' column in Staff Log
-                # We rename both 'date' and 'Date' to 'date' to ensure consistency.
-                df_staff = df_staff.rename(columns={'date': 'date', 'Date': 'date'}, errors='ignore')
+                # 🎯 FINAL POSITIONAL FIX: Rename the first column to 'date' 🎯
+                # This ignores any invisible characters in the header by using its position.
+                if len(df_staff.columns) > 0:
+                    df_staff = df_staff.rename(columns={df_staff.columns[0]: 'date'}, errors='ignore')
 
                 # 2. Preprocessing Sales
                 # Columns are now lowercase with underscores!
@@ -65,12 +66,14 @@ if staff_file and sales_file:
                 df_sales['patient_norm'] = df_sales['patient'].astype(str).str.strip().str.lower()
 
                 # 3. Preprocessing Staff
-                # Columns are now lowercase with underscores! The 'date' column must now be ready!
+                # The 'date' column must now be correct due to positional rename!
                 df_staff['date_obj'] = pd.to_datetime(df_staff['date'])
                 df_staff['date_str'] = df_staff['date_obj'].dt.date.astype(str)
                 df_staff['extracted_name'] = df_staff['notes'].apply(extract_name)
                 df_staff['name_norm'] = df_staff['extracted_name'].str.lower()
-
+                
+                # ... (rest of the code is unchanged) ...
+                
                 # 4. Merging
                 merged_df = pd.merge(
                     df_staff,
@@ -80,8 +83,8 @@ if staff_file and sales_file:
                     how='outer',
                     indicator=True
                 )
-
-                # 5. Labeling and Amount Check 
+                
+                # 5. Labeling and Amount Check (using check_amount_v2 and status_map)
                 status_map = {
                     'both': 'Matched',
                     'left_only': 'In Staff Log Only (Missing in Sales)',
@@ -89,9 +92,11 @@ if staff_file and sales_file:
                 }
                 merged_df['Status'] = merged_df['_merge'].map(status_map)
                 
-                merged_df['Amount_Status'] = merged_df.apply(check_amount_v2, axis=1)
+                # Helper function defined earlier that uses lowercase names: check_amount_v2
+                merged_df['Amount_Status'] = merged_df.apply(check_amount_v2, axis=1) 
 
                 # 6. Final Report Columns (Original capitalization for display)
+                # ... (column selection and renaming to original case) ...
                 desired_cols = ['date', 'extracted_name', 'notes', 'charged_amount',
                                 'invoice_date', 'patient', 'item', 'subtotal', 'Status', 'Amount_Status']
                 
@@ -106,7 +111,7 @@ if staff_file and sales_file:
 
                 final_report = merged_df[desired_cols].rename(columns=rename_map)
 
-                # --- Display Results ---
+                # --- Display Results and Download Button (omitted for brevity) ---
                 st.markdown("### 📊 Reconciliation Summary")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Total Matches", len(final_report[final_report['Status']=='Matched']))
@@ -126,10 +131,8 @@ if staff_file and sales_file:
                 )
 
         except Exception as e:
-            # Display the column error clearly for diagnosis
             st.error(f"An error occurred: {e}")
-            st.warning("A critical column is missing or unreadable. Please ensure your CSV files have the correct header names: **Date**, **Notes**, **Charged_Amount**, **Patient**, **Invoice Date**, **Item**, and **Subtotal**.")
+            st.warning("A critical column is missing or unreadable. Please ensure your CSV files have the correct header names and file contents.")
 
 else:
     st.info("👋 Please upload both CSV files in the sidebar to begin.")
-

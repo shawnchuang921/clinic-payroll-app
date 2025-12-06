@@ -25,10 +25,11 @@ def extract_name(note):
     clean_name = re.sub(pattern, '', note, flags=re.IGNORECASE)
     return clean_name.strip()
 
-def check_amount(row):
-    """Compare charged amount vs subtotal."""
+def check_amount_v2(row):
+    """Compare charged amount vs subtotal using lowercase names."""
     if row['Status'] == 'Matched':
-        if row.get('Charged_Amount') == row.get('Subtotal'):
+        # Check charged_amount vs subtotal
+        if row.get('charged_amount') == row.get('subtotal'):
             return 'Match'
         else:
             return 'Mismatch'
@@ -45,15 +46,13 @@ if staff_file and sales_file:
                 df_staff = pd.read_csv(staff_file, encoding='latin1', engine='python', on_bad_lines='skip')
                 df_sales = pd.read_csv(sales_file, encoding='latin1', engine='python', on_bad_lines='skip')
 
-                # --- NEW RESILIENCE BLOCK: Clean Column Names ---
+                # --- RESILIENCE BLOCK: Clean Column Names ---
                 # This fixes invisible spaces or case mismatches in headers
                 df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
                 df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
                 
-                # We update the expected column names to reflect the cleaned, lowercase, underscore format.
-                
                 # 2. Preprocessing Sales
-                # NOTE: Columns are now lowercase with underscores!
+                # Columns are now lowercase with underscores!
                 df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
                 df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], utc=True)
                 # Convert to Vancouver time
@@ -62,7 +61,7 @@ if staff_file and sales_file:
                 df_sales['patient_norm'] = df_sales['patient'].astype(str).str.strip().str.lower()
 
                 # 3. Preprocessing Staff
-                # NOTE: Columns are now lowercase with underscores!
+                # Columns are now lowercase with underscores! The 'date' column is ready!
                 df_staff['date_obj'] = pd.to_datetime(df_staff['date'])
                 df_staff['date_str'] = df_staff['date_obj'].dt.date.astype(str)
                 df_staff['extracted_name'] = df_staff['notes'].apply(extract_name)
@@ -78,7 +77,7 @@ if staff_file and sales_file:
                     indicator=True
                 )
 
-                # 5. Labeling and Amount Check (Uses lowercase column names)
+                # 5. Labeling and Amount Check 
                 status_map = {
                     'both': 'Matched',
                     'left_only': 'In Staff Log Only (Missing in Sales)',
@@ -86,16 +85,6 @@ if staff_file and sales_file:
                 }
                 merged_df['Status'] = merged_df['_merge'].map(status_map)
                 
-                # Update check_amount to use lowercase names
-                def check_amount_v2(row):
-                    if row['Status'] == 'Matched':
-                        # Check charged_amount vs subtotal
-                        if row.get('charged_amount') == row.get('subtotal'):
-                            return 'Match'
-                        else:
-                            return 'Mismatch'
-                    return 'N/A'
-
                 merged_df['Amount_Status'] = merged_df.apply(check_amount_v2, axis=1)
 
                 # 6. Final Report Columns (Original capitalization for display)
@@ -135,7 +124,7 @@ if staff_file and sales_file:
         except Exception as e:
             # Display a more user-friendly error message
             st.error(f"An error occurred: {e}")
-            st.warning("Please ensure your CSV files have the correct column headers: Date, Notes, Charged_Amount, Patient, Invoice Date, Item, and Subtotal.")
+            st.warning("A critical column is missing or unreadable. Please ensure your CSV files have the correct header names: **Date**, **Notes**, **Charged_Amount**, **Patient**, **Invoice Date**, **Item**, and **Subtotal**.")
 
 else:
     st.info("👋 Please upload both CSV files in the sidebar to begin.")

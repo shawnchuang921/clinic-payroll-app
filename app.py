@@ -17,7 +17,7 @@ st.sidebar.header("1. Upload Data")
 staff_file = st.sidebar.file_uploader("Upload Staff Log (CSV)", type=['csv'])
 sales_file = st.sidebar.file_uploader("Upload Sales Record (CSV)", type=['csv'])
 
-# --- Processing Logic ---
+# --- Processing Logic (Functions remain the same) ---
 def extract_name(note):
     """Clean name from notes by removing time patterns."""
     if not isinstance(note, str): return ""
@@ -42,9 +42,9 @@ if staff_file and sales_file:
     if st.button("Run Reconciliation"):
         try:
             with st.spinner('Processing records...'):
-                # 1. Load Data
-                df_staff = pd.read_csv(staff_file)
-                df_sales = pd.read_csv(sales_file)
+                # 1. Load Data - FIX IMPLEMENTED HERE: Added encoding='latin1'
+                df_staff = pd.read_csv(staff_file, encoding='latin1')
+                df_sales = pd.read_csv(sales_file, encoding='latin1')
 
                 # 2. Preprocessing Sales
                 df_sales = df_sales.dropna(subset=['Patient', 'Invoice Date'])
@@ -80,21 +80,17 @@ if staff_file and sales_file:
                 merged_df['Amount_Status'] = merged_df.apply(check_amount, axis=1)
 
                 # 6. Final Report Columns
-                # Ensure columns exist before selecting them to avoid errors
-                available_cols = merged_df.columns.tolist()
-                
-                # Define ideal column order, but filter based on what actually exists
+                # ... (rest of the column filtering and renaming logic) ...
                 desired_cols = ['Date_x', 'extracted_name', 'Notes', 'Charged_Amount',
                                 'Invoice Date', 'Patient', 'Item', 'Subtotal', 'Status', 'Amount_Status']
                 
-                # Rename dict
                 rename_map = {'Date_x': 'Date', 'extracted_name': 'Staff_Patient_Name'}
                 
-                # Handle cases where Date_x might be NaN (from right_only merge), fill with sales date
                 if 'Date_x' in merged_df.columns and 'date_str' in merged_df.columns:
                      merged_df['Date_x'] = merged_df['Date_x'].fillna(merged_df['date_str'])
 
                 final_report = merged_df[desired_cols].rename(columns=rename_map)
+
 
                 # --- Display Results ---
                 

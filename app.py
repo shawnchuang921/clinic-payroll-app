@@ -8,9 +8,10 @@ from difflib import SequenceMatcher
 # --- Page Configuration ---
 st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 
-st.title("🏥 Clinic Staff vs. Sales Reconciler (Final Column Fix)")
+st.title("🏥 Clinic Staff vs. Sales Reconciler (Final Code)")
 st.markdown("""
-This version fixes the final column naming issue (`'staff_name_staff'`) by correctly referencing the **`staff_name`** column from the merged data.
+This application performs a detailed, smart reconciliation between staff logs and sales records.
+All known column-naming and metric calculation bugs have been fixed in this version.
 """)
 
 # --- Sidebar: File Uploads ---
@@ -80,6 +81,7 @@ def extract_expected_hours(item):
     return None
 
 def check_hours_validation(row):
+    """Checks for mismatch between staff direct hours and sales expected hours."""
     if row['Status'] != 'Matched':
         return 'N/A'
     
@@ -89,6 +91,7 @@ def check_hours_validation(row):
     if pd.isna(staff_hrs) and pd.isna(expected_hrs): return 'Missing Data'
     if pd.isna(staff_hrs) or pd.isna(expected_hrs): return 'Missing Staff/Sales Hrs'
     
+    # Compare hours with a small tolerance for floating point errors
     if round(staff_hrs, 2) == round(expected_hrs, 2):
         return 'Match'
     else:
@@ -137,7 +140,7 @@ def check_amount_final(row):
         
         # Check if Charged_Amount is 0 but sales is non-zero (The Hourly Rate Staff Fix)
         if round(staff_charge, 2) == 0 and round(sales_subtotal, 2) > 0:
-             return f'Mismatch: Staff Log Charged Amount is $0, but Sales is ${sales_subtotal}. (Possible Travel Fee Error)'
+             return f'Mismatch: Staff Total Charge (${staff_total_charge}) != Sales Subtotal (${sales_subtotal}).'
 
 
     # Scenario B: Sales Subtotal suggests a fee, but Staff Log does not reflect it.
@@ -186,6 +189,39 @@ def get_staff_pay_types(df_staff):
     return staff_pay_types[['staff_name', 'Pay_Type', 'staff_name_lower']]
 
 
+def calculate_metrics(df, pay_type):
+    """Calculates summary metrics based on pay type, using corrected logic for Hourly staff."""
+    # Standard metrics
+    matched_count = len(df[df['Status'] == 'Matched'])
+    staff_only_count = len(df[df['Status'] == 'In Staff Log Only (Missing in Sales)'])
+    sales_only_count = len(df[df['Status'] == 'In Sales Record Only (Missing in Log)'])
+    
+    # Logic for Critical Mismatch Errors (error_count)
+    if pay_type == 'Hourly':
+        # 1. Count Hours Mismatches
+        hours_mismatch = len(df[(df['Status'] == 'Matched') & (df['Hours_Validation_Status'].str.startswith('Mismatch', na=False))])
+        
+        # 2. ONLY count Amount Mismatches that explicitly mention 'Travel Fee' 
+        # (This correctly ignores the common $0.0 Charged_Amount entry error)
+        travel_fee_mismatch = len(df[
+            (df['Status'] == 'Matched') & 
+            (df['Amount_Status'].str.contains('Mismatch', na=False)) & 
+            (df['Amount_Status'].str.contains('Travel Fee', na=False))
+        ])
+        
+        # 3. The critical error count is the sum of these two specific types
+        error_count = hours_mismatch + travel_fee_mismatch
+    
+    elif pay_type == 'Percentage':
+        # Percentage staff must match on amount (including travel fee logic)
+        error_count = len(df[(df['Status'] == 'Matched') & (df['Amount_Status'].str.contains('Mismatch', na=False))])
+    
+    else:
+        error_count = 0
+            
+    return matched_count, error_count, staff_only_count, sales_only_count
+
+
 # --- Run App ---
 if staff_file and sales_file:
     st.sidebar.success("Files uploaded successfully!")
@@ -230,9 +266,9 @@ if staff_file and sales_file:
                 df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
                 df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], errors='coerce')
                 
-                # FIX 1: Timezone error fix (Confirmed working)
+                # Timezone error fix
                 if df_sales['dt_obj'].dt.tz is None:
-                    # Use ambiguous='NaT' for safety, removing the invalid 'errors' argument
+                    # Use ambiguous='NaT' for safety
                     df_sales['dt_obj'] = df_sales['dt_obj'].dt.tz_localize('UTC', ambiguous='NaT').dt.tz_convert('America/Vancouver')
                     
                 df_sales['date_str'] = df_sales['dt_obj'].dt.normalize().astype(str).str[:10]
@@ -254,6 +290,7 @@ if staff_file and sales_file:
                 
                 def get_date_diff(row):
                     if pd.notna(row['date_obj']) and pd.notna(row['dt_obj']):
+                        # Use .date() to compare just the date part
                         return abs((row['date_obj'].date() - row['dt_obj'].date()).days)
                     return 999 
 
@@ -283,7 +320,7 @@ if staff_file and sales_file:
                         match_dict = row.to_dict()
                         match_dict['Status'] = 'Matched'
                         match_dict['Match_Type'] = f"Match (Diff: {row['date_diff']} days)"
-                        # FIX 2: Correctly reference 'staff_name' since no conflict means no suffix was applied
+                        # FIX: Correctly reference 'staff_name' since the column name was not conflicting
                         match_dict['Staff_Name_Final'] = row['staff_name'] 
                         final_rows.append(match_dict)
                         matched_staff_ids.add(sid)
@@ -358,24 +395,7 @@ if staff_file and sales_file:
                 df_hourly = final_report[final_report['Staff_Pay_Type'] == 'Hourly'].copy()
                 df_percentage = final_report[final_report['Staff_Pay_Type'] == 'Percentage'].copy()
                 
-                def calculate_metrics(df, pay_type):
-                    matched_count = len(df[df['Status'] == 'Matched'])
-                    staff_only_count = len(df[df['Status'] == 'In Staff Log Only (Missing in Sales)'])
-                    sales_only_count = len(df[df['Status'] == 'In Sales Record Only (Missing in Log)'])
-                    
-                    if pay_type == 'Hourly':
-                        hours_mismatch = len(df[(df['Status'] == 'Matched') & (df['Hours_Validation_Status'].str.startswith('Mismatch', na=False))])
-                        amount_mismatch = len(df[(df['Status'] == 'Matched') & (df['Amount_Status'].str.contains('Mismatch', na=False))])
-                        error_count = hours_mismatch + amount_mismatch
-                    
-                    elif pay_type == 'Percentage':
-                        error_count = len(df[(df['Status'] == 'Matched') & (df['Amount_Status'].str.startswith('Mismatch', na=False))])
-                    
-                    else:
-                        error_count = 0
-                        
-                    return matched_count, error_count, staff_only_count, sales_only_count
-                
+                # Recalculate metrics using the corrected function
                 h_matched, h_error, h_staff_only, h_sales_only = calculate_metrics(df_hourly, 'Hourly')
                 p_matched, p_error, p_staff_only, p_sales_only = calculate_metrics(df_percentage, 'Percentage')
 
@@ -387,7 +407,7 @@ if staff_file and sales_file:
                 st.markdown("#### Hourly Rate Staff Summary")
                 col1, col2, col3, col4 = st.columns(4) 
                 col1.metric("Total Matches (1-to-1)", h_matched)
-                col2.metric("**Critical Mismatch Errors (Hrs + Amount)**", h_error, help="Includes errors where Direct Hours mismatch AND general amount mismatches (including travel fee discrepancies).") 
+                col2.metric("**Critical Mismatch Errors (Hrs + Travel Fee)**", h_error, help="Includes errors where Direct Hours mismatch AND amount mismatches specifically related to Travel Fees.") 
                 col3.metric("In Staff Log Only", h_staff_only)
                 col4.metric("In Sales Record Only", h_sales_only)
 
@@ -410,7 +430,7 @@ if staff_file and sales_file:
                 st.download_button(
                     label="📥 Download Report as CSV",
                     data=csv,
-                    file_name='Reconciliation_Report_Fixed_Errors_and_Names.csv',
+                    file_name='Reconciliation_Report_FINAL.csv',
                     mime='text/csv',
                 )
 

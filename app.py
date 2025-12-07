@@ -9,7 +9,7 @@ st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 
 st.title("🏥 Clinic Staff vs. Sales Reconciler (Error Refinement)")
 st.markdown("""
-The reconciliation now flags **Travel Fee Discrepancies** for hourly staff by combining it with the Hours Mismatch Errors into a single **Critical Mismatch Errors** metric.
+The reconciliation now flags **Travel Fee Discrepancies** for all staff by dynamically inferring the expected session price, correcting the issue where `Charged_Amount` might be zero in the staff log.
 """)
 
 # --- Sidebar: File Uploads ---
@@ -82,7 +82,8 @@ def check_hours_validation(row):
 
 def check_amount_final(row):
     """
-    Validates Charged_Amount vs Subtotal, accounting for Travel Fee.
+    Validates Charged_Amount vs Subtotal, accounting for Travel Fee, with a fix 
+    for inconsistent Charged_Amount entry (e.g., when it is 0).
     """
     if row['Status'] != 'Matched':
         return 'N/A'
@@ -92,29 +93,44 @@ def check_amount_final(row):
     travel_fee = row.get('travel_fee_used', 0)
     sales_subtotal = row.get('subtotal', 0)
     total_pay = row.get('total_pay', 0) 
+    expected_hours = row.get('expected_hours', 0)
     
     # Safely retrieve and standardize Outside_Clinic status
     outside_clinic = str(row.get('outside_clinic', 'no')).strip().lower()
     
     # Calculate the expected total charge from the staff log
     staff_total_charge = staff_charge + travel_fee
+    
+    # --- Dynamic Base Price Assumption (used when Charged_Amount is unreliable/0) ---
+    # Assume base rate is $160 per hour if expected_hours is available
+    expected_base_price = expected_hours * 160.0
+    
+    # Check for staff claiming a home session
+    staff_flags_home_session = (outside_clinic == 'yes') and (travel_fee > 0)
 
     # 1. Primary Check: Does Staff Total Charge (Base + Travel) match Sales Subtotal?
     if round(staff_total_charge, 2) == round(sales_subtotal, 2):
-        if outside_clinic == 'yes' and travel_fee > 0:
+        if staff_flags_home_session:
              return 'Match (Inc. Travel Fee)'
         return 'Match'
     
     # 2. Travel Fee Mismatch Scenarios 
     
-    # Scenario A: Staff log indicates a fee, but Sales Subtotal is missing it (i.e., Sales Subtotal equals only the base charge).
-    # THIS IS THE SPECIFIC HOURLY ERROR THE USER WANTS TO CATCH
-    if outside_clinic == 'yes' and travel_fee > 0 and round(staff_charge, 2) == round(sales_subtotal, 2):
-        return f'Mismatch: Staff Log indicates Home Session (+$20), but Sales Subtotal (${sales_subtotal}) is missing Travel Fee.'
+    # Scenario A: Staff log indicates a fee, but Sales Subtotal is missing it (i.e., Sales Subtotal matches base price).
+    if staff_flags_home_session:
+        
+        # FIX FOR CHARGED_AMOUNT=0: If Charged_Amount is 0 OR the Sales Subtotal matches the dynamic base price, flag the error.
+        if (round(staff_charge, 2) == 0 and round(sales_subtotal, 2) == round(expected_base_price, 2)) or \
+           (round(staff_charge, 2) > 0 and round(staff_charge, 2) == round(sales_subtotal, 2)):
+                
+            return f'Mismatch: Staff Log indicates Home Session (+$20), but Sales Subtotal (${sales_subtotal}) is missing Travel Fee.'
 
     # Scenario B: Sales Subtotal suggests a fee, but Staff Log does not reflect it.
-    if outside_clinic != 'yes' and travel_fee == 0 and round(staff_charge + 20, 2) == round(sales_subtotal, 2):
-         return f'Mismatch: Sales Subtotal (${sales_subtotal}) suggests Home Session (+$20) not reflected in Staff Log.'
+    if not staff_flags_home_session and travel_fee == 0:
+        # Check if Sales Subtotal matches expected base price + 20
+        if round(sales_subtotal, 2) == round(expected_base_price + 20.0, 2):
+             return f'Mismatch: Sales Subtotal (${sales_subtotal}) suggests Home Session (+$20) not reflected in Staff Log.'
+
 
     # 3. Secondary Check: Does Total Pay match Sales Subtotal?
     if round(total_pay, 2) == round(sales_subtotal, 2):
@@ -149,7 +165,7 @@ if staff_file and sales_file:
     
     if st.button("Run Reconciliation"):
         try:
-            with st.spinner('Processing records with Smart Matching and Travel Fee Logic...'):
+            with st.spinner('Processing records with Smart Matching and Corrected Travel Fee Logic...'):
                 # 1. Load Data
                 df_staff = pd.read_csv(staff_file, encoding='latin1', engine='python', on_bad_lines='skip')
                 df_sales = pd.read_csv(sales_file, encoding='latin1', engine='python', on_bad_lines='skip')
@@ -167,6 +183,7 @@ if staff_file and sales_file:
                 # Clean Travel Fee/Outside Clinic Columns
                 df_staff['travel_fee_used'] = pd.to_numeric(df_staff['travel_fee_used'], errors='coerce').fillna(0)
                 df_staff['outside_clinic'] = df_staff['outside_clinic'].astype(str).str.strip().str.lower()
+                df_staff['charged_amount'] = pd.to_numeric(df_staff['charged_amount'], errors='coerce').fillna(0) # Ensure charged_amount is numeric
 
                 # Determine Staff Pay Type and Merge
                 df_pay_types = get_staff_pay_types(df_staff.copy())
@@ -340,7 +357,7 @@ if staff_file and sales_file:
                 st.download_button(
                     label="📥 Download Report as CSV",
                     data=csv,
-                    file_name='Reconciliation_Report_Dual_Pay_Travel_v2.csv',
+                    file_name='Reconciliation_Report_Dual_Pay_Travel_Final.csv',
                     mime='text/csv',
                 )
 

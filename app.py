@@ -8,9 +8,9 @@ from difflib import SequenceMatcher
 # --- Page Configuration ---
 st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 
-st.title("🏥 Clinic Staff vs. Sales Reconciler (Staff Name Added)")
+st.title("🏥 Clinic Staff vs. Sales Reconciler (Error Fix & Staff Name)")
 st.markdown("""
-The reconciliation report now includes the **Staff Member** name, making it easy to filter the final exported CSV for a specific person's reconciliation results.
+The timezone error has been fixed. The reconciliation report now includes the **Staff Member** name, making it easy to filter the final exported CSV.
 """)
 
 # --- Sidebar: File Uploads ---
@@ -180,7 +180,7 @@ def get_staff_pay_types(df_staff):
     staff_pay_types = staff_pay_totals.apply(determine_pay_type, axis=1).reset_index(name='Pay_Type')
     
     # Handle name normalization for staff_name to match sales record's 'staff_member'
-    staff_pay_types['staff_name_lower'] = staff_pay_types['staff_name'].str.lower()
+    staff_pay_types['staff_name_lower'] = staff_pay_types['staff_name'].astype(str).str.lower()
     
     return staff_pay_types[['staff_name', 'Pay_Type', 'staff_name_lower']]
 
@@ -191,7 +191,7 @@ if staff_file and sales_file:
     
     if st.button("Run Reconciliation"):
         try:
-            with st.spinner('Processing records with Smart Matching and Updated Summary Logic...'):
+            with st.spinner('Processing records with Smart Matching and Error Fix...'):
                 
                 # 1. Load Data
                 df_staff = pd.read_csv(staff_file, encoding='latin1', engine='python', on_bad_lines='skip')
@@ -229,9 +229,14 @@ if staff_file and sales_file:
                 # Process Sales Dates & Names
                 df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
                 df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], errors='coerce')
-                # Use a reasonable default time zone conversion if dates are present
-                if not df_sales['dt_obj'].dt.tz:
-                    df_sales['dt_obj'] = df_sales['dt_obj'].dt.tz_localize('UTC', errors='coerce').dt.tz_convert('America/Vancouver', errors='coerce')
+                
+                # --- FIX FOR DatetimeIndex.tz_localize() ERROR ---
+                # Use a reasonable default time zone conversion if dates are present and are naive (dt.tz is None).
+                # The 'errors' argument is removed from tz_localize and tz_convert.
+                if df_sales['dt_obj'].dt.tz is None:
+                    df_sales['dt_obj'] = df_sales['dt_obj'].dt.tz_localize('UTC', ambiguous='NaT').dt.tz_convert('America/Vancouver')
+                # --- END FIX ---
+                    
                 df_sales['date_str'] = df_sales['dt_obj'].dt.normalize().astype(str).str[:10]
                 df_sales['patient_norm'] = df_sales['patient'].apply(clean_name_string) 
                 df_sales['expected_hours'] = df_sales['item'].apply(extract_expected_hours)
@@ -332,7 +337,7 @@ if staff_file and sales_file:
                 
                 rename_map = {
                     'Display_Date': 'Date (Reconciled)', 
-                    'Staff_Name_Final': 'Staff_Member', # New column name
+                    'Staff_Name_Final': 'Staff_Member', # New column name for filtering
                     'extracted_name': 'Client_Name (Staff Log)',
                     'Pay_Type': 'Staff_Pay_Type',
                     'notes': 'Staff_Notes', 
@@ -410,7 +415,7 @@ if staff_file and sales_file:
                 st.download_button(
                     label="📥 Download Report as CSV",
                     data=csv,
-                    file_name='Reconciliation_Report_Final_Staff_Names.csv',
+                    file_name='Reconciliation_Report_Fixed_Error_and_Names.csv',
                     mime='text/csv',
                 )
 

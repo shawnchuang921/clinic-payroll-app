@@ -8,9 +8,9 @@ from difflib import SequenceMatcher
 # --- Page Configuration ---
 st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 
-st.title("🏥 Clinic Staff vs. Sales Reconciler (Error Fix & Staff Name)")
+st.title("🏥 Clinic Staff vs. Sales Reconciler (Robust Column Fix)")
 st.markdown("""
-The timezone error has been fixed. The reconciliation report now includes the **Staff Member** name, making it easy to filter the final exported CSV.
+The latest code includes fixes for both the timezone bug and the column naming issue ('staff_name_staff'). The final report continues to include the **Staff_Member** column for easy filtering.
 """)
 
 # --- Sidebar: File Uploads ---
@@ -18,7 +18,7 @@ st.sidebar.header("1. Upload Data")
 staff_file = st.sidebar.file_uploader("Upload Combined Staff Log (CSV)", type=['csv'])
 sales_file = st.sidebar.file_uploader("Upload Sales Record (CSV)", type=['csv'])
 
-# --- Helper Functions ---
+# --- Helper Functions (No changes here, keeping them hidden for brevity) ---
 def clean_name_string(name):
     """Aggressively removes all non-alphabetic characters for reliable fuzzy matching."""
     if not isinstance(name, str): return ""
@@ -161,6 +161,7 @@ def get_staff_pay_types(df_staff):
     for col in numeric_cols:
         df_staff[col] = pd.to_numeric(df_staff[col], errors='coerce').fillna(0)
     
+    # Assumes 'staff_name' column exists due to robust check/rename in main logic
     staff_pay_totals = df_staff.groupby('staff_name')[numeric_cols].sum()
     
     def determine_pay_type(row):
@@ -203,6 +204,15 @@ if staff_file and sales_file:
                 df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
                 df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
                 
+                # NEW FIX: Robust Staff Name Column Check/Rename for consistency before merge
+                if 'staff_member' in df_staff.columns and 'staff_name' not in df_staff.columns:
+                    # If staff log uses 'staff_member' instead of 'staff_name', rename it for consistency.
+                    df_staff.rename(columns={'staff_member': 'staff_name'}, inplace=True)
+                elif 'staff_name' not in df_staff.columns:
+                    # If 'staff_name' is still missing, we can't proceed.
+                    raise ValueError("Staff Log is missing a recognizable 'Staff Name' column ('staff_name' or 'staff_member').")
+
+
                 # Positional Fix for Staff Date
                 if len(df_staff.columns) > 0 and 'date' not in df_staff.columns:
                     df_staff = df_staff.rename(columns={df_staff.columns[0]: 'date'}, errors='ignore')
@@ -213,8 +223,8 @@ if staff_file and sales_file:
                 df_staff['charged_amount'] = pd.to_numeric(df_staff['charged_amount'], errors='coerce').fillna(0) 
                 
                 # Determine Staff Pay Type and Create Pay Type Map
+                # This now relies on the renamed 'staff_name' column
                 df_pay_types = get_staff_pay_types(df_staff.copy())
-                # Create a map: lower_staff_name -> Pay_Type for quick lookups
                 pay_type_map = df_pay_types.set_index('staff_name_lower')['Pay_Type'].to_dict()
                 
                 # Merge Pay Type onto staff data (for matched/staff-only records)
@@ -230,12 +240,10 @@ if staff_file and sales_file:
                 df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
                 df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], errors='coerce')
                 
-                # --- FIX FOR DatetimeIndex.tz_localize() ERROR ---
-                # Use a reasonable default time zone conversion if dates are present and are naive (dt.tz is None).
-                # The 'errors' argument is removed from tz_localize and tz_convert.
+                # FIX 1: Timezone error fix
                 if df_sales['dt_obj'].dt.tz is None:
+                    # Use ambiguous='NaT' for safety, removing the invalid 'errors' argument
                     df_sales['dt_obj'] = df_sales['dt_obj'].dt.tz_localize('UTC', ambiguous='NaT').dt.tz_convert('America/Vancouver')
-                # --- END FIX ---
                     
                 df_sales['date_str'] = df_sales['dt_obj'].dt.normalize().astype(str).str[:10]
                 df_sales['patient_norm'] = df_sales['patient'].apply(clean_name_string) 
@@ -263,12 +271,12 @@ if staff_file and sales_file:
                 candidates = potential_matches[potential_matches['date_diff'] <= 1].copy()
                 candidates['service_score'] = candidates.apply(calculate_keyword_score, axis=1)
                 
-                # Use a composite score: service score + (100 - date_diff) - 10 if names are very different
+                # Use a composite score
                 def get_match_score(row):
                     similarity = SequenceMatcher(None, row['name_norm'], row['patient_norm']).ratio()
                     score = row['service_score'] + (100 - row['date_diff'])
                     if similarity < 0.7:
-                        score -= 20 # Penalize low name similarity
+                        score -= 20 
                     return score
 
                 candidates['match_score'] = candidates.apply(get_match_score, axis=1)
@@ -278,47 +286,48 @@ if staff_file and sales_file:
                 matched_sales_ids = set()
                 final_rows = []
 
+                # Process Matched Records
                 for _, row in candidates.iterrows():
                     sid, slid = row['staff_id'], row['sales_id']
                     if pd.notna(sid) and pd.notna(slid) and sid not in matched_staff_ids and slid not in matched_sales_ids:
                         match_dict = row.to_dict()
                         match_dict['Status'] = 'Matched'
                         match_dict['Match_Type'] = f"Match (Diff: {row['date_diff']} days)"
-                        # Add Staff Name
-                        match_dict['Staff_Name_Final'] = row['staff_name_staff']
+                        # Staff Name is from the staff log (staff_name_staff) because we renamed the column earlier
+                        match_dict['Staff_Name_Final'] = row['staff_name_staff'] 
                         final_rows.append(match_dict)
                         matched_staff_ids.add(sid)
                         matched_sales_ids.add(slid)
 
-                # Handle Unmatched Records 
+                # Process Unmatched Staff Records 
                 unmatched_staff = df_staff[~df_staff['staff_id'].isin(matched_staff_ids)].copy()
                 for _, row in unmatched_staff.iterrows():
                     new_row = row.to_dict()
                     if 'date_str' in new_row: new_row['date_str_staff'] = new_row.pop('date_str')
                     new_row['Status'], new_row['Match_Type'] = 'In Staff Log Only (Missing in Sales)', 'N/A'
-                    # Add Staff Name
-                    new_row['Staff_Name_Final'] = row['staff_name']
-                    # Populate necessary columns with None/NaN
+                    # Staff Name is from the staff log's 'staff_name' column
+                    new_row['Staff_Name_Final'] = row['staff_name'] 
+                    # Populate necessary sales columns with None/NaN
                     new_row.update({'invoice_date': None, 'patient': None, 'item': None, 'subtotal': None, 'expected_hours': None, 'staff_member': None})
                     final_rows.append(new_row)
 
+                # Process Unmatched Sales Records
                 unmatched_sales = df_sales[~df_sales['sales_id'].isin(matched_sales_ids)].copy()
                 for _, row in unmatched_sales.iterrows():
                     new_row = row.to_dict()
                     new_row['date_str_sales'] = new_row.pop('date_str')
                     
-                    # Look up the Pay_Type using the staff member name in the sales record
                     sales_staff_lower = new_row.get('staff_member_lower')
                     inferred_pay_type = pay_type_map.get(sales_staff_lower, 'Unknown')
                     
-                    # Add Staff Name (from sales record)
+                    # Staff Name is from the sales record's 'staff_member' column
                     new_row['Staff_Name_Final'] = row['staff_member']
 
                     # Populate necessary staff columns with None/NaN
                     new_row.update({
                         'date_str_staff': None, 'date': None, 'extracted_name': None, 'notes': None, 
                         'charged_amount': None, 'direct_hrs': None, 'outside_clinic': None, 
-                        'travel_fee_used': None, 'Pay_Type': inferred_pay_type  # Set the INFERRED Pay_Type
+                        'travel_fee_used': None, 'Pay_Type': inferred_pay_type 
                     })
                     new_row['Status'], new_row['Match_Type'] = 'In Sales Record Only (Missing in Log)', 'N/A'
                     final_rows.append(new_row)
@@ -330,6 +339,7 @@ if staff_file and sales_file:
                 final_df['Hours_Validation_Status'] = final_df.apply(check_hours_validation, axis=1)
                 final_df['Display_Date'] = final_df['date_str_staff'].fillna(final_df['date_str_sales'])
 
+                # Column order with new Staff_Member column first
                 report_cols = ['Display_Date', 'Staff_Name_Final', 'Pay_Type', 'extracted_name', 'notes', 
                                'outside_clinic', 'travel_fee_used', 'direct_hrs', 'charged_amount', 
                                'invoice_date', 'patient', 'item', 'expected_hours', 'subtotal', 
@@ -337,7 +347,7 @@ if staff_file and sales_file:
                 
                 rename_map = {
                     'Display_Date': 'Date (Reconciled)', 
-                    'Staff_Name_Final': 'Staff_Member', # New column name for filtering
+                    'Staff_Name_Final': 'Staff_Member', 
                     'extracted_name': 'Client_Name (Staff Log)',
                     'Pay_Type': 'Staff_Pay_Type',
                     'notes': 'Staff_Notes', 
@@ -356,8 +366,7 @@ if staff_file and sales_file:
                 available_cols = [c for c in report_cols if c in final_df.columns]
                 final_report = final_df[available_cols].rename(columns=rename_map)
 
-                # --- METRICS CALCULATION ---
-                
+                # --- METRICS CALCULATION (omitted for brevity) ---
                 df_hourly = final_report[final_report['Staff_Pay_Type'] == 'Hourly'].copy()
                 df_percentage = final_report[final_report['Staff_Pay_Type'] == 'Percentage'].copy()
                 
@@ -367,13 +376,11 @@ if staff_file and sales_file:
                     sales_only_count = len(df[df['Status'] == 'In Sales Record Only (Missing in Log)'])
                     
                     if pay_type == 'Hourly':
-                        # Hours Mismatch Errors & Amount Mismatch Errors
                         hours_mismatch = len(df[(df['Status'] == 'Matched') & (df['Hours_Validation_Status'].str.startswith('Mismatch', na=False))])
                         amount_mismatch = len(df[(df['Status'] == 'Matched') & (df['Amount_Status'].str.contains('Mismatch', na=False))])
                         error_count = hours_mismatch + amount_mismatch
                     
                     elif pay_type == 'Percentage':
-                        # All Amount Mismatch errors are critical for percentage pay staff
                         error_count = len(df[(df['Status'] == 'Matched') & (df['Amount_Status'].str.startswith('Mismatch', na=False))])
                     
                     else:
@@ -404,7 +411,7 @@ if staff_file and sales_file:
                 col1.metric("Total Matches (1-to-1)", p_matched)
                 col2.metric("**Amount Mismatch Errors**", p_error, help="Includes general Subtotal mismatches and errors related to missing/mismatched Travel Fees.") 
                 col3.metric("In Staff Log Only", p_staff_only)
-                col4.metric("In Sales Record Only", p_sales_only, help="This now correctly includes entries like 'no-shows' attributed to the Percentage Pay staff member.")
+                col4.metric("In Sales Record Only", p_sales_only)
                 
                 st.markdown("---")
 
@@ -415,13 +422,18 @@ if staff_file and sales_file:
                 st.download_button(
                     label="📥 Download Report as CSV",
                     data=csv,
-                    file_name='Reconciliation_Report_Fixed_Error_and_Names.csv',
+                    file_name='Reconciliation_Report_Fixed_Errors_and_Names.csv',
                     mime='text/csv',
                 )
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
             st.warning("A critical error prevents processing. Please ensure your CSV files are correctly formatted and uploaded.")
+            # For debugging, you could print the list of columns to help the user check their file structure
+            if staff_file and 'df_staff' in locals():
+                st.info(f"Staff Log Columns Found: {list(df_staff.columns)}")
+            if sales_file and 'df_sales' in locals():
+                st.info(f"Sales Record Columns Found: {list(df_sales.columns)}")
 
 else:
     st.info("👋 Please upload both CSV files in the sidebar to begin.")

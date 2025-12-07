@@ -35,7 +35,6 @@ def calculate_keyword_score(row):
     """
     Gives a bonus score if the Staff Notes and Sales Item share key service words.
     """
-    # Use lowercase keys 'notes' and 'item'
     if pd.isna(row.get('notes')) or pd.isna(row.get('item')):
         return 0
     
@@ -45,10 +44,9 @@ def calculate_keyword_score(row):
     keywords = ['report', 'assessment', 'intervention', 'session', 'consultation', 'writing']
     score = 0
     
-    # Check for keyword overlap
     for kw in keywords:
         if kw in staff_note and kw in sales_item:
-            score += 10 # 10 points for a service type match
+            score += 10
             
     return score
 
@@ -92,7 +90,7 @@ if staff_file and sales_file:
 
                 # --- MATCHING LOGIC ---
                 
-                # 1. Outer Merge on Name Only (Get all potential candidates)
+                # 1. Outer Merge on Name Only
                 potential_matches = pd.merge(
                     df_staff,
                     df_sales,
@@ -110,14 +108,12 @@ if staff_file and sales_file:
 
                 potential_matches['date_diff'] = potential_matches.apply(get_date_diff, axis=1)
                 
-                # Keep only matches within 1 day
                 candidates = potential_matches[potential_matches['date_diff'] <= 1].copy()
                 
-                # 3. Score the Candidates (Keyword Match)
+                # 3. Score the Candidates
                 candidates['service_score'] = candidates.apply(calculate_keyword_score, axis=1)
                 
                 # 4. GREEDY ASSIGNMENT (The 1-to-1 Logic)
-                # Sort: Service Score (High->Low), then Date Diff (Low->High)
                 candidates = candidates.sort_values(by=['service_score', 'date_diff'], ascending=[False, True])
                 
                 matched_staff_ids = set()
@@ -129,9 +125,7 @@ if staff_file and sales_file:
                     sid = row['staff_id']
                     slid = row['sales_id']
                     
-                    # If both this staff record and sales record are still free, match them!
                     if sid not in matched_staff_ids and slid not in matched_sales_ids:
-                        # FIX: Convert matched row to dict immediately
                         match_dict = row.to_dict()
                         match_dict['Status'] = 'Matched'
                         match_dict['Match_Type'] = f"Match (Diff: {row['date_diff']} days)"
@@ -146,6 +140,10 @@ if staff_file and sales_file:
                 unmatched_staff = df_staff[~df_staff['staff_id'].isin(matched_staff_ids)].copy()
                 for _, row in unmatched_staff.iterrows():
                     new_row = row.to_dict()
+                    # FIX: Harmonize date string column name to match merged data
+                    if 'date_str' in new_row:
+                        new_row['date_str_staff'] = new_row.pop('date_str')
+                        
                     new_row['Status'] = 'In Staff Log Only (Missing in Sales)'
                     new_row['Match_Type'] = 'N/A'
                     # Fill missing sales columns
@@ -159,6 +157,10 @@ if staff_file and sales_file:
                 unmatched_sales = df_sales[~df_sales['sales_id'].isin(matched_sales_ids)].copy()
                 for _, row in unmatched_sales.iterrows():
                     new_row = row.to_dict()
+                    # FIX: Harmonize date string column name and create staff-side key
+                    new_row['date_str_sales'] = new_row.pop('date_str')
+                    new_row['date_str_staff'] = None # Create staff-side key for consistency
+                    
                     new_row['Status'] = 'In Sales Record Only (Missing in Log)'
                     new_row['Match_Type'] = 'N/A'
                     # Fill missing staff columns
@@ -183,14 +185,14 @@ if staff_file and sales_file:
 
                 final_df['Amount_Status'] = final_df.apply(check_amount_final, axis=1)
                 
-                # Consolidate Date Column
-                final_df['Display_Date'] = final_df['date'].fillna(final_df['date_str'])
+                # Use the harmonized staff date string as the primary display date
+                # We rename it at the end to keep the column selection simple
+                final_df['Display_Date'] = final_df['date_str_staff'].fillna(final_df['date_str_sales'])
 
                 report_cols = ['Display_Date', 'extracted_name', 'notes', 'charged_amount',
                                'invoice_date', 'patient', 'item', 'subtotal', 
                                'Status', 'Amount_Status', 'Match_Type']
                 
-                # Rename for display
                 rename_map = {
                     'Display_Date': 'Date (Staff Log)', 
                     'extracted_name': 'Staff_Patient_Name',
@@ -203,7 +205,6 @@ if staff_file and sales_file:
                     'Match_Type': 'Date_Tolerance'
                 }
 
-                # Ensure columns exist before selecting
                 available_cols = [c for c in report_cols if c in final_df.columns]
                 final_report = final_df[available_cols].rename(columns=rename_map)
 

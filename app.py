@@ -35,7 +35,7 @@ def calculate_keyword_score(row):
     """
     Gives a bonus score if the Staff Notes and Sales Item share key service words.
     """
-    # FIX: Use lowercase keys 'notes' and 'item' because we standardized columns earlier
+    # Use lowercase keys 'notes' and 'item'
     if pd.isna(row.get('notes')) or pd.isna(row.get('item')):
         return 0
     
@@ -103,24 +103,21 @@ if staff_file and sales_file:
                 )
                 
                 # 2. Filter Candidates by Date Tolerance (must be within 1 day)
-                # Helper to calc date diff
                 def get_date_diff(row):
                     if pd.notna(row['date_obj']) and pd.notna(row['dt_obj']):
                         return abs((row['date_obj'].date() - row['dt_obj'].date()).days)
-                    return 999 # High number if no date match
+                    return 999 
 
                 potential_matches['date_diff'] = potential_matches.apply(get_date_diff, axis=1)
                 
-                # Keep only matches within 1 day, OR rows that failed to match (NaNs)
+                # Keep only matches within 1 day
                 candidates = potential_matches[potential_matches['date_diff'] <= 1].copy()
                 
                 # 3. Score the Candidates (Keyword Match)
                 candidates['service_score'] = candidates.apply(calculate_keyword_score, axis=1)
                 
                 # 4. GREEDY ASSIGNMENT (The 1-to-1 Logic)
-                # Sort candidates by: 
-                #   1. Service Score (Highest first - prefer "Report" matches "Report")
-                #   2. Date Diff (Lowest first - prefer 0 days over 1 day)
+                # Sort: Service Score (High->Low), then Date Diff (Low->High)
                 candidates = candidates.sort_values(by=['service_score', 'date_diff'], ascending=[False, True])
                 
                 matched_staff_ids = set()
@@ -134,41 +131,44 @@ if staff_file and sales_file:
                     
                     # If both this staff record and sales record are still free, match them!
                     if sid not in matched_staff_ids and slid not in matched_sales_ids:
-                        row['Status'] = 'Matched'
-                        row['Match_Type'] = f"Match (Diff: {row['date_diff']} days)"
-                        final_rows.append(row)
+                        # FIX: Convert matched row to dict immediately
+                        match_dict = row.to_dict()
+                        match_dict['Status'] = 'Matched'
+                        match_dict['Match_Type'] = f"Match (Diff: {row['date_diff']} days)"
+                        final_rows.append(match_dict)
+                        
                         matched_staff_ids.add(sid)
                         matched_sales_ids.add(slid)
 
                 # 5. Handle Unmatched Records
                 
-                # Find Staff records that were NOT matched
+                # Unmatched Staff
                 unmatched_staff = df_staff[~df_staff['staff_id'].isin(matched_staff_ids)].copy()
                 for _, row in unmatched_staff.iterrows():
                     new_row = row.to_dict()
                     new_row['Status'] = 'In Staff Log Only (Missing in Sales)'
                     new_row['Match_Type'] = 'N/A'
-                    # Fill missing sales columns with NaN
+                    # Fill missing sales columns
                     new_row['invoice_date'] = None
                     new_row['patient'] = None
                     new_row['item'] = None
                     new_row['subtotal'] = None
                     final_rows.append(new_row)
 
-                # Find Sales records that were NOT matched
+                # Unmatched Sales
                 unmatched_sales = df_sales[~df_sales['sales_id'].isin(matched_sales_ids)].copy()
                 for _, row in unmatched_sales.iterrows():
                     new_row = row.to_dict()
                     new_row['Status'] = 'In Sales Record Only (Missing in Log)'
                     new_row['Match_Type'] = 'N/A'
-                    # Fill missing staff columns with NaN
+                    # Fill missing staff columns
                     new_row['date'] = None
                     new_row['extracted_name'] = None
                     new_row['notes'] = None
                     new_row['charged_amount'] = None
                     final_rows.append(new_row)
 
-                # Create Final DataFrame
+                # Create Final DataFrame from list of dicts
                 final_df = pd.DataFrame(final_rows)
                 
                 # --- FINAL REPORT FORMATTING ---
@@ -203,7 +203,9 @@ if staff_file and sales_file:
                     'Match_Type': 'Date_Tolerance'
                 }
 
-                final_report = final_df[report_cols].rename(columns=rename_map)
+                # Ensure columns exist before selecting
+                available_cols = [c for c in report_cols if c in final_df.columns]
+                final_report = final_df[available_cols].rename(columns=rename_map)
 
                 # --- METRICS ---
                 matched_count = len(final_report[final_report['Status'] == 'Matched'])

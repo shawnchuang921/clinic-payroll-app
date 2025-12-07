@@ -35,11 +35,12 @@ def calculate_keyword_score(row):
     """
     Gives a bonus score if the Staff Notes and Sales Item share key service words.
     """
-    if pd.isna(row['Notes']) or pd.isna(row['Item']):
+    # FIX: Use lowercase keys 'notes' and 'item' because we standardized columns earlier
+    if pd.isna(row.get('notes')) or pd.isna(row.get('item')):
         return 0
     
-    staff_note = str(row['Notes']).lower()
-    sales_item = str(row['Item']).lower()
+    staff_note = str(row['notes']).lower()
+    sales_item = str(row['item']).lower()
     
     keywords = ['report', 'assessment', 'intervention', 'session', 'consultation', 'writing']
     score = 0
@@ -111,7 +112,6 @@ if staff_file and sales_file:
                 potential_matches['date_diff'] = potential_matches.apply(get_date_diff, axis=1)
                 
                 # Keep only matches within 1 day, OR rows that failed to match (NaNs)
-                # We split into "candidates" (Name matched + Date close) and "unmatched"
                 candidates = potential_matches[potential_matches['date_diff'] <= 1].copy()
                 
                 # 3. Score the Candidates (Keyword Match)
@@ -145,7 +145,6 @@ if staff_file and sales_file:
                 # Find Staff records that were NOT matched
                 unmatched_staff = df_staff[~df_staff['staff_id'].isin(matched_staff_ids)].copy()
                 for _, row in unmatched_staff.iterrows():
-                    # Create a row structure matching the final report
                     new_row = row.to_dict()
                     new_row['Status'] = 'In Staff Log Only (Missing in Sales)'
                     new_row['Match_Type'] = 'N/A'

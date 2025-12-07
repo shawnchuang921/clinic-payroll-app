@@ -7,9 +7,9 @@ import numpy as np
 # --- Page Configuration ---
 st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 
-st.title("🏥 Clinic Staff vs. Sales Reconciler (Travel Fee & Dual Pay)")
+st.title("🏥 Clinic Staff vs. Sales Reconciler (Error Refinement)")
 st.markdown("""
-Upload the **Combined Staff Log** and the **Sales Record**. The reconciliation now handles home sessions by validating the inclusion of the travel fee in the Sales Subtotal against the Staff Log entry.
+The reconciliation now flags **Travel Fee Discrepancies** for hourly staff by combining it with the Hours Mismatch Errors into a single **Critical Mismatch Errors** metric.
 """)
 
 # --- Sidebar: File Uploads ---
@@ -91,7 +91,7 @@ def check_amount_final(row):
     staff_charge = row.get('charged_amount', 0)
     travel_fee = row.get('travel_fee_used', 0)
     sales_subtotal = row.get('subtotal', 0)
-    total_pay = row.get('total_pay', 0) # Used for secondary check
+    total_pay = row.get('total_pay', 0) 
     
     # Safely retrieve and standardize Outside_Clinic status
     outside_clinic = str(row.get('outside_clinic', 'no')).strip().lower()
@@ -101,24 +101,24 @@ def check_amount_final(row):
 
     # 1. Primary Check: Does Staff Total Charge (Base + Travel) match Sales Subtotal?
     if round(staff_total_charge, 2) == round(sales_subtotal, 2):
-        # Match, and indicate if travel fee was included in the calculation
         if outside_clinic == 'yes' and travel_fee > 0:
              return 'Match (Inc. Travel Fee)'
         return 'Match'
     
-    # 2. Travel Fee Mismatch Scenarios (assuming standard travel fee is $20 if present)
+    # 2. Travel Fee Mismatch Scenarios 
     
-    # Scenario A: Staff log indicates a home session (e.g., $20 travel fee), but Sales Subtotal is missing it (i.e., Sales Subtotal equals only the base charge).
+    # Scenario A: Staff log indicates a fee, but Sales Subtotal is missing it (i.e., Sales Subtotal equals only the base charge).
+    # THIS IS THE SPECIFIC HOURLY ERROR THE USER WANTS TO CATCH
     if outside_clinic == 'yes' and travel_fee > 0 and round(staff_charge, 2) == round(sales_subtotal, 2):
         return f'Mismatch: Staff Log indicates Home Session (+$20), but Sales Subtotal (${sales_subtotal}) is missing Travel Fee.'
 
-    # Scenario B: Sales Subtotal suggests a home session (e.g., Sales Subtotal is $20 higher than staff base charge), but Staff Log does not reflect it.
+    # Scenario B: Sales Subtotal suggests a fee, but Staff Log does not reflect it.
     if outside_clinic != 'yes' and travel_fee == 0 and round(staff_charge + 20, 2) == round(sales_subtotal, 2):
          return f'Mismatch: Sales Subtotal (${sales_subtotal}) suggests Home Session (+$20) not reflected in Staff Log.'
 
-    # 3. Secondary Check: Does Total Pay match Sales Subtotal (for cases like the percentage pay example)?
+    # 3. Secondary Check: Does Total Pay match Sales Subtotal?
     if round(total_pay, 2) == round(sales_subtotal, 2):
-        return 'Mismatch (Pay Match)' # General mismatch, but pay is reconciled
+        return 'Mismatch (Pay Match)' 
 
     # 4. Final Fallback: General Mismatch
     return f'Mismatch: Staff Total Charge (${staff_total_charge}) != Sales Subtotal (${sales_subtotal})'
@@ -164,7 +164,7 @@ if staff_file and sales_file:
                 if len(df_staff.columns) > 0:
                     df_staff = df_staff.rename(columns={df_staff.columns[0]: 'date'}, errors='ignore')
 
-                # NEW: Clean Travel Fee/Outside Clinic Columns
+                # Clean Travel Fee/Outside Clinic Columns
                 df_staff['travel_fee_used'] = pd.to_numeric(df_staff['travel_fee_used'], errors='coerce').fillna(0)
                 df_staff['outside_clinic'] = df_staff['outside_clinic'].astype(str).str.strip().str.lower()
 
@@ -220,7 +220,7 @@ if staff_file and sales_file:
                         matched_staff_ids.add(sid)
                         matched_sales_ids.add(slid)
 
-                # Handle Unmatched Records (Keep Pay_Type consistent)
+                # Handle Unmatched Records 
                 unmatched_staff = df_staff[~df_staff['staff_id'].isin(matched_staff_ids)].copy()
                 for _, row in unmatched_staff.iterrows():
                     new_row = row.to_dict()
@@ -234,14 +234,13 @@ if staff_file and sales_file:
                     new_row = row.to_dict()
                     new_row['date_str_sales'] = new_row.pop('date_str')
                     new_row['date_str_staff'], new_row['date'], new_row['extracted_name'], new_row['notes'], new_row['charged_amount'], new_row['direct_hrs'] = None, None, None, None, None, None
-                    # Fill Staff-side columns for unmatched sales to avoid key errors later
                     new_row['Pay_Type'], new_row['outside_clinic'], new_row['travel_fee_used'] = None, None, None 
                     new_row['Status'], new_row['Match_Type'] = 'In Sales Record Only (Missing in Log)', 'N/A'
                     final_rows.append(new_row)
 
                 final_df = pd.DataFrame(final_rows)
                 
-                # --- FINAL REPORT FORMATTING ---
+                # --- FINAL REPORT VALIDATION & FORMATTING ---
                 final_df['Amount_Status'] = final_df.apply(check_amount_final, axis=1)
                 final_df['Hours_Validation_Status'] = final_df.apply(check_hours_validation, axis=1)
                 final_df['Display_Date'] = final_df['date_str_staff'].fillna(final_df['date_str_sales'])
@@ -256,8 +255,8 @@ if staff_file and sales_file:
                     'extracted_name': 'Staff_Patient_Name',
                     'Pay_Type': 'Staff_Pay_Type',
                     'notes': 'Notes', 
-                    'outside_clinic': 'Staff_Outside_Clinic', # NEW COLUMN
-                    'travel_fee_used': 'Staff_Travel_Fee', # NEW COLUMN
+                    'outside_clinic': 'Staff_Outside_Clinic',
+                    'travel_fee_used': 'Staff_Travel_Fee',
                     'direct_hrs': 'Staff_Direct_Hrs', 
                     'charged_amount': 'Charged_Amount',
                     'invoice_date': 'Invoice Date', 
@@ -271,36 +270,44 @@ if staff_file and sales_file:
                 available_cols = [c for c in report_cols if c in final_df.columns]
                 final_report = final_df[available_cols].rename(columns=rename_map)
 
-                # --- METRICS CALCULATION ---
+                # --- METRICS CALCULATION (Updated for Hourly Critical Errors) ---
                 
-                # Split the final report by Pay_Type (filtering out unmatched sales with None Pay_Type)
                 df_hourly = final_report[final_report['Staff_Pay_Type'] == 'Hourly'].copy()
                 df_percentage = final_report[final_report['Staff_Pay_Type'] == 'Percentage'].copy()
                 
-                def calculate_metrics(df, error_type):
+                def calculate_metrics(df, pay_type):
                     matched_count = len(df[df['Status'] == 'Matched'])
                     staff_only_count = len(df[df['Status'] == 'In Staff Log Only (Missing in Sales)'])
                     sales_only_count = len(df[df['Status'] == 'In Sales Record Only (Missing in Log)'])
                     
-                    if error_type == 'Hours':
-                        # Count Hours Mismatch errors
-                        error_count = len(df[
+                    if pay_type == 'Hourly':
+                        # 1. Hours Mismatch Errors
+                        hours_mismatch = len(df[
                             (df['Status'] == 'Matched') & 
                             (df['Hours_Validation_Status'].str.startswith('Mismatch', na=False))
                         ])
-                    elif error_type == 'Amount':
-                        # Count Amount Mismatch errors, including new travel fee errors
+                        # 2. Travel Fee Data Entry Error (Staff recorded fee, Sales did not)
+                        travel_fee_error = len(df[
+                            (df['Status'] == 'Matched') & 
+                            (df['Amount_Status'].str.contains('Staff Log indicates Home Session', na=False))
+                        ])
+                        # Sum both for the critical mismatch metric
+                        error_count = hours_mismatch + travel_fee_error
+                    
+                    elif pay_type == 'Percentage':
+                        # All Amount Mismatch errors are critical for percentage pay staff
                         error_count = len(df[
                             (df['Status'] == 'Matched') & 
                             (df['Amount_Status'].str.startswith('Mismatch', na=False))
                         ])
+                    
                     else:
                         error_count = 0
                         
                     return matched_count, error_count, staff_only_count, sales_only_count
                 
-                h_matched, h_error, h_staff_only, h_sales_only = calculate_metrics(df_hourly, 'Hours')
-                p_matched, p_error, p_staff_only, p_sales_only = calculate_metrics(df_percentage, 'Amount')
+                h_matched, h_error, h_staff_only, h_sales_only = calculate_metrics(df_hourly, 'Hourly')
+                p_matched, p_error, p_staff_only, p_sales_only = calculate_metrics(df_percentage, 'Percentage')
 
                 # --- Display Results ---
                 
@@ -310,17 +317,17 @@ if staff_file and sales_file:
                 st.markdown("#### Hourly Rate Staff Summary")
                 col1, col2, col3, col4 = st.columns(4) 
                 col1.metric("Total Matches (1-to-1)", h_matched)
-                col2.metric("**Hours Mismatch Errors**", h_error) 
+                col2.metric("**Critical Mismatch Errors (Hrs + Travel Fee)**", h_error, help="Includes errors where Direct Hours mismatch AND errors where Staff recorded a travel fee but the Sales Subtotal did not.") 
                 col3.metric("In Staff Log Only", h_staff_only)
                 col4.metric("In Sales Record Only", h_sales_only)
 
                 st.markdown("---")
                 
                 # Percentage Pay Staff Summary
-                st.markdown("#### Percentage Pay Staff Summary (Travel Fee Validation Active)")
+                st.markdown("#### Percentage Pay Staff Summary")
                 col1, col2, col3, col4 = st.columns(4) 
                 col1.metric("Total Matches (1-to-1)", p_matched)
-                col2.metric("**Amount Mismatch Errors**", p_error) 
+                col2.metric("**Amount Mismatch Errors**", p_error, help="Includes general Subtotal mismatches and errors related to missing/mismatched Travel Fees.") 
                 col3.metric("In Staff Log Only", p_staff_only)
                 col4.metric("In Sales Record Only", p_sales_only)
                 
@@ -333,13 +340,13 @@ if staff_file and sales_file:
                 st.download_button(
                     label="📥 Download Report as CSV",
                     data=csv,
-                    file_name='Reconciliation_Report_Dual_Pay_Travel.csv',
+                    file_name='Reconciliation_Report_Dual_Pay_Travel_v2.csv',
                     mime='text/csv',
                 )
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
-            st.warning("A critical error prevents processing. Please ensure your combined Staff Log CSV file is correctly formatted and contains the necessary columns.")
+            st.warning("A critical error prevents processing. Please ensure your CSV files are correctly formatted and uploaded.")
 
 else:
     st.info("👋 Please upload both CSV files in the sidebar to begin.")

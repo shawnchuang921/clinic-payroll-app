@@ -48,7 +48,6 @@ def calculate_keyword_score(row):
             
     return score
 
-# NEW HELPER: Extract expected hours from sales item
 def extract_expected_hours(item):
     """Parses the session length (e.g., '60 mins') from the sales item description."""
     if not isinstance(item, str):
@@ -68,7 +67,6 @@ def extract_expected_hours(item):
 
     return None # Cannot determine hours
 
-# NEW HELPER: Validate recorded hours against expected hours
 def check_hours_validation(row):
     if row['Status'] != 'Matched':
         return 'N/A'
@@ -190,7 +188,7 @@ if staff_file and sales_file:
                     new_row['patient'] = None
                     new_row['item'] = None
                     new_row['subtotal'] = None
-                    new_row['expected_hours'] = None # <-- ADDED for consistency
+                    new_row['expected_hours'] = None 
                     final_rows.append(new_row)
 
                 # Unmatched Sales
@@ -208,7 +206,7 @@ if staff_file and sales_file:
                     new_row['extracted_name'] = None
                     new_row['notes'] = None
                     new_row['charged_amount'] = None
-                    new_row['direct_hrs'] = None # <-- ADDED for consistency
+                    new_row['direct_hrs'] = None 
                     final_rows.append(new_row)
 
                 # Create Final DataFrame from list of dicts
@@ -220,7 +218,7 @@ if staff_file and sales_file:
                     if row['Status'] == 'Matched':
                         if row.get('charged_amount') == row.get('subtotal'):
                             return 'Match'
-                        # NEW CHECK: Does Total Pay match Subtotal? (Useful for gross payroll check)
+                        # Check if Total Pay matches Subtotal (for cases like the Pedro Coelho example)
                         elif row.get('total_pay') == row.get('subtotal'):
                             return 'Mismatch (Pay Match)'
                         else:
@@ -229,7 +227,7 @@ if staff_file and sales_file:
 
                 final_df['Amount_Status'] = final_df.apply(check_amount_final, axis=1)
                 
-                # NEW: Hours Validation Status
+                # Hours Validation Status
                 final_df['Hours_Validation_Status'] = final_df.apply(check_hours_validation, axis=1)
 
                 # Use the harmonized staff date string as the primary display date
@@ -243,12 +241,12 @@ if staff_file and sales_file:
                     'Display_Date': 'Date (Staff Log)', 
                     'extracted_name': 'Staff_Patient_Name',
                     'notes': 'Notes', 
-                    'direct_hrs': 'Staff_Direct_Hrs', # RENAMED
+                    'direct_hrs': 'Staff_Direct_Hrs', 
                     'charged_amount': 'Charged_Amount',
                     'invoice_date': 'Invoice Date', 
                     'patient': 'Patient',
                     'item': 'Item', 
-                    'expected_hours': 'Sales_Expected_Hrs', # RENAMED
+                    'expected_hours': 'Sales_Expected_Hrs', 
                     'subtotal': 'Subtotal',
                     'Match_Type': 'Date_Tolerance'
                 }
@@ -260,13 +258,21 @@ if staff_file and sales_file:
                 matched_count = len(final_report[final_report['Status'] == 'Matched'])
                 staff_only_count = len(final_report[final_report['Status'] == 'In Staff Log Only (Missing in Sales)'])
                 sales_only_count = len(final_report[final_report['Status'] == 'In Sales Record Only (Missing in Log)'])
+                
+                # NEW METRIC: Hours Mismatch Errors
+                hours_mismatch_count = len(final_report[
+                    (final_report['Status'] == 'Matched') &
+                    (final_report['Hours_Validation_Status'].str.startswith('Mismatch', na=False))
+                ])
 
                 # --- Display Results ---
                 st.markdown("### 📊 Reconciliation Summary")
-                col1, col2, col3 = st.columns(3)
+                # Updated to use 4 columns
+                col1, col2, col3, col4 = st.columns(4) 
                 col1.metric("Total Matches (1-to-1)", matched_count)
-                col2.metric("In Staff Log Only", staff_only_count)
-                col3.metric("In Sales Record Only", sales_only_count)
+                col2.metric("Hours Mismatch Errors", hours_mismatch_count) # NEW DISPLAY
+                col3.metric("In Staff Log Only", staff_only_count)
+                col4.metric("In Sales Record Only", sales_only_count)
 
                 st.markdown("### 📋 Detailed Report")
                 st.dataframe(final_report, use_container_width=True)

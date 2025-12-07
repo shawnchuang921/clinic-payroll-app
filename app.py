@@ -9,7 +9,7 @@ st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 st.title("🏥 Clinic Staff vs. Sales Reconciler")
 st.markdown("""
 Upload the **Staff Log** and the **Sales Record** below. 
-The app uses **Smart 1-to-1 Matching** to align records based on Name, Date, and Service Type.
+The app now uses **Smart 1-to-1 Matching** and includes **Hours Validation** to detect mismatches in recorded time vs. expected service duration.
 """)
 
 # --- Sidebar: File Uploads ---
@@ -32,9 +32,7 @@ def extract_name(note):
     return clean_name.strip()
 
 def calculate_keyword_score(row):
-    """
-    Gives a bonus score if the Staff Notes and Sales Item share key service words.
-    """
+    """Gives a bonus score if the Staff Notes and Sales Item share key service words."""
     if pd.isna(row.get('notes')) or pd.isna(row.get('item')):
         return 0
     
@@ -49,6 +47,45 @@ def calculate_keyword_score(row):
             score += 10
             
     return score
+
+# NEW HELPER: Extract expected hours from sales item
+def extract_expected_hours(item):
+    """Parses the session length (e.g., '60 mins') from the sales item description."""
+    if not isinstance(item, str):
+        return None
+    item = item.lower()
+    
+    # 1. Look for 'X mins' or 'X min'
+    match_min = re.search(r'(\d+)\s*mins?$', item)
+    if match_min:
+        minutes = int(match_min.group(1))
+        return minutes / 60.0 # Convert minutes to hours (e.g., 60/60 = 1.0)
+    
+    # 2. Look for 'X hours' or 'X hour'
+    match_hr = re.search(r'(\d+)\s*hours?$', item)
+    if match_hr:
+        return float(match_hr.group(1))
+
+    return None # Cannot determine hours
+
+# NEW HELPER: Validate recorded hours against expected hours
+def check_hours_validation(row):
+    if row['Status'] != 'Matched':
+        return 'N/A'
+    
+    staff_hrs = row.get('direct_hrs')
+    expected_hrs = row.get('expected_hours')
+    
+    if pd.isna(staff_hrs) and pd.isna(expected_hrs):
+        return 'Missing Data'
+    if pd.isna(staff_hrs) or pd.isna(expected_hrs):
+        return 'Missing Staff/Sales Hrs'
+    
+    # Compare hours, allowing for minor floating point differences
+    if round(staff_hrs, 2) == round(expected_hrs, 2):
+        return 'Match'
+    else:
+        return f'Mismatch: Staff Hrs ({staff_hrs}) != Expected Hrs ({expected_hrs})'
 
 # --- Run App ---
 if staff_file and sales_file:
@@ -81,6 +118,8 @@ if staff_file and sales_file:
                 df_sales['dt_local'] = df_sales['dt_obj'].dt.tz_convert('America/Vancouver')
                 df_sales['date_str'] = df_sales['dt_local'].dt.normalize().astype(str).str[:10]
                 df_sales['patient_norm'] = df_sales['patient'].apply(clean_name_string) 
+                # NEW: Extract expected hours
+                df_sales['expected_hours'] = df_sales['item'].apply(extract_expected_hours)
 
                 # Process Staff Dates & Names
                 df_staff['date_obj'] = pd.to_datetime(df_staff['date'])
@@ -140,7 +179,7 @@ if staff_file and sales_file:
                 unmatched_staff = df_staff[~df_staff['staff_id'].isin(matched_staff_ids)].copy()
                 for _, row in unmatched_staff.iterrows():
                     new_row = row.to_dict()
-                    # FIX: Harmonize date string column name to match merged data
+                    # Harmonize date string column name
                     if 'date_str' in new_row:
                         new_row['date_str_staff'] = new_row.pop('date_str')
                         
@@ -151,15 +190,16 @@ if staff_file and sales_file:
                     new_row['patient'] = None
                     new_row['item'] = None
                     new_row['subtotal'] = None
+                    new_row['expected_hours'] = None # <-- ADDED for consistency
                     final_rows.append(new_row)
 
                 # Unmatched Sales
                 unmatched_sales = df_sales[~df_sales['sales_id'].isin(matched_sales_ids)].copy()
                 for _, row in unmatched_sales.iterrows():
                     new_row = row.to_dict()
-                    # FIX: Harmonize date string column name and create staff-side key
+                    # Harmonize date string column name and create staff-side key
                     new_row['date_str_sales'] = new_row.pop('date_str')
-                    new_row['date_str_staff'] = None # Create staff-side key for consistency
+                    new_row['date_str_staff'] = None 
                     
                     new_row['Status'] = 'In Sales Record Only (Missing in Log)'
                     new_row['Match_Type'] = 'N/A'
@@ -168,6 +208,7 @@ if staff_file and sales_file:
                     new_row['extracted_name'] = None
                     new_row['notes'] = None
                     new_row['charged_amount'] = None
+                    new_row['direct_hrs'] = None # <-- ADDED for consistency
                     final_rows.append(new_row)
 
                 # Create Final DataFrame from list of dicts
@@ -179,28 +220,35 @@ if staff_file and sales_file:
                     if row['Status'] == 'Matched':
                         if row.get('charged_amount') == row.get('subtotal'):
                             return 'Match'
+                        # NEW CHECK: Does Total Pay match Subtotal? (Useful for gross payroll check)
+                        elif row.get('total_pay') == row.get('subtotal'):
+                            return 'Mismatch (Pay Match)'
                         else:
                             return 'Mismatch'
                     return 'N/A'
 
                 final_df['Amount_Status'] = final_df.apply(check_amount_final, axis=1)
                 
+                # NEW: Hours Validation Status
+                final_df['Hours_Validation_Status'] = final_df.apply(check_hours_validation, axis=1)
+
                 # Use the harmonized staff date string as the primary display date
-                # We rename it at the end to keep the column selection simple
                 final_df['Display_Date'] = final_df['date_str_staff'].fillna(final_df['date_str_sales'])
 
-                report_cols = ['Display_Date', 'extracted_name', 'notes', 'charged_amount',
-                               'invoice_date', 'patient', 'item', 'subtotal', 
-                               'Status', 'Amount_Status', 'Match_Type']
+                report_cols = ['Display_Date', 'extracted_name', 'notes', 'direct_hrs', 'charged_amount', 
+                               'invoice_date', 'patient', 'item', 'expected_hours', 'subtotal', 
+                               'Status', 'Amount_Status', 'Hours_Validation_Status', 'Match_Type']
                 
                 rename_map = {
                     'Display_Date': 'Date (Staff Log)', 
                     'extracted_name': 'Staff_Patient_Name',
                     'notes': 'Notes', 
+                    'direct_hrs': 'Staff_Direct_Hrs', # RENAMED
                     'charged_amount': 'Charged_Amount',
                     'invoice_date': 'Invoice Date', 
                     'patient': 'Patient',
                     'item': 'Item', 
+                    'expected_hours': 'Sales_Expected_Hrs', # RENAMED
                     'subtotal': 'Subtotal',
                     'Match_Type': 'Date_Tolerance'
                 }

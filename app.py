@@ -3,13 +3,14 @@ import pandas as pd
 import re
 import io
 import numpy as np
+from difflib import SequenceMatcher
 
 # --- Page Configuration ---
 st.set_page_config(page_title="Clinic Payroll Reconciler", layout="wide")
 
-st.title("🏥 Clinic Staff vs. Sales Reconciler (Error Refinement)")
+st.title("🏥 Clinic Staff vs. Sales Reconciler (Summary Fix)")
 st.markdown("""
-The reconciliation now flags **Travel Fee Discrepancies** for all staff by dynamically inferring the expected session price, correcting the issue where `Charged_Amount` might be zero in the staff log.
+The reconciliation summary now correctly attributes **'In Sales Record Only'** entries (like no-shows) to the relevant staff member's pay type (Hourly or Percentage).
 """)
 
 # --- Sidebar: File Uploads ---
@@ -25,8 +26,21 @@ def clean_name_string(name):
     return cleaned
 
 def extract_name(note):
-    """Clean name from notes by removing time patterns."""
+    """Clean name from notes by removing time patterns. Tries to capture the client name from the start."""
     if not isinstance(note, str): return ""
+    
+    # Try to extract the first part of the string before a time range or service description
+    pattern = r'^(.*?)\s+\d{1,2}(?::\d{2})?-\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)?.*$'
+    match = re.search(pattern, note, flags=re.IGNORECASE)
+    
+    if match:
+        extracted = match.group(1).strip()
+        # Further clean by removing common service terms at the end
+        extracted = re.sub(r'\s+(OT|PT|SLP|Assessment|Intervention|Report|Consultation|Session|Writing)\s*$', '', extracted, flags=re.IGNORECASE)
+        if extracted:
+            return extracted.strip()
+            
+    # Fallback to a simpler cleaning approach
     pattern = r'\s+\d{1,2}(?::\d{2})?-\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)?.*$'
     clean_name = re.sub(pattern, '', note, flags=re.IGNORECASE)
     return clean_name.strip()
@@ -83,7 +97,7 @@ def check_hours_validation(row):
 def check_amount_final(row):
     """
     Validates Charged_Amount vs Subtotal, accounting for Travel Fee, with a fix 
-    for inconsistent Charged_Amount entry (e.g., when it is 0).
+    for inconsistent Charged_Amount entry (e.g., when it is 0) and the previous issue.
     """
     if row['Status'] != 'Matched':
         return 'N/A'
@@ -92,7 +106,6 @@ def check_amount_final(row):
     staff_charge = row.get('charged_amount', 0)
     travel_fee = row.get('travel_fee_used', 0)
     sales_subtotal = row.get('subtotal', 0)
-    total_pay = row.get('total_pay', 0) 
     expected_hours = row.get('expected_hours', 0)
     
     # Safely retrieve and standardize Outside_Clinic status
@@ -101,7 +114,7 @@ def check_amount_final(row):
     # Calculate the expected total charge from the staff log
     staff_total_charge = staff_charge + travel_fee
     
-    # --- Dynamic Base Price Assumption (used when Charged_Amount is unreliable/0) ---
+    # --- Dynamic Base Price Assumption ---
     # Assume base rate is $160 per hour if expected_hours is available
     expected_base_price = expected_hours * 160.0
     
@@ -118,12 +131,15 @@ def check_amount_final(row):
     
     # Scenario A: Staff log indicates a fee, but Sales Subtotal is missing it (i.e., Sales Subtotal matches base price).
     if staff_flags_home_session:
-        
-        # FIX FOR CHARGED_AMOUNT=0: If Charged_Amount is 0 OR the Sales Subtotal matches the dynamic base price, flag the error.
-        if (round(staff_charge, 2) == 0 and round(sales_subtotal, 2) == round(expected_base_price, 2)) or \
-           (round(staff_charge, 2) > 0 and round(staff_charge, 2) == round(sales_subtotal, 2)):
+        # Check if Sales Subtotal matches the dynamic base price (which implies missing travel fee in sales)
+        if round(sales_subtotal, 2) == round(expected_base_price, 2):
                 
             return f'Mismatch: Staff Log indicates Home Session (+$20), but Sales Subtotal (${sales_subtotal}) is missing Travel Fee.'
+        
+        # Check if Charged_Amount is 0 but sales is non-zero (The Hourly Rate Staff Fix)
+        if round(staff_charge, 2) == 0 and round(sales_subtotal, 2) > 0:
+             return f'Mismatch: Staff Log Charged Amount is $0, but Sales is ${sales_subtotal}. (Possible Travel Fee Error)'
+
 
     # Scenario B: Sales Subtotal suggests a fee, but Staff Log does not reflect it.
     if not staff_flags_home_session and travel_fee == 0:
@@ -132,31 +148,44 @@ def check_amount_final(row):
              return f'Mismatch: Sales Subtotal (${sales_subtotal}) suggests Home Session (+$20) not reflected in Staff Log.'
 
 
-    # 3. Secondary Check: Does Total Pay match Sales Subtotal?
-    if round(total_pay, 2) == round(sales_subtotal, 2):
-        return 'Mismatch (Pay Match)' 
-
-    # 4. Final Fallback: General Mismatch
+    # 3. Final Fallback: General Mismatch
     return f'Mismatch: Staff Total Charge (${staff_total_charge}) != Sales Subtotal (${sales_subtotal})'
 
 def get_staff_pay_types(df_staff):
     """
     Categorizes staff as 'Hourly' or 'Percentage' based on their dominant pay calculation column.
     """
-    numeric_cols = ['direct_pay', 'percentage_pay']
+    # Standardize column names
+    df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
+    
+    numeric_cols = ['direct_pay', 'indirect_pay', 'percentage_pay']
     for col in numeric_cols:
         df_staff[col] = pd.to_numeric(df_staff[col], errors='coerce').fillna(0)
     
     staff_pay_totals = df_staff.groupby('staff_name')[numeric_cols].sum()
     
     def determine_pay_type(row):
-        if row['direct_pay'] >= row['percentage_pay']:
+        # A simple check: if Direct/Indirect pay dominates, it's Hourly; otherwise Percentage.
+        # This handles the common scenario where one column is used exclusively.
+        hourly_pay = row['direct_pay'] + row['indirect_pay']
+        percentage_pay = row['percentage_pay']
+        
+        if hourly_pay > 0 and percentage_pay == 0:
             return 'Hourly'
-        else:
+        elif percentage_pay > 0 and hourly_pay == 0:
             return 'Percentage'
+        elif hourly_pay > 0 and percentage_pay > 0:
+            # For mixed pay, prioritize the larger component
+            return 'Hourly' if hourly_pay >= percentage_pay else 'Percentage'
+        else:
+            return 'Unknown'
 
     staff_pay_types = staff_pay_totals.apply(determine_pay_type, axis=1).reset_index(name='Pay_Type')
-    return staff_pay_types[['staff_name', 'Pay_Type']]
+    
+    # Handle name normalization for staff_name to match sales record's 'staff_member'
+    staff_pay_types['staff_name_lower'] = staff_pay_types['staff_name'].str.lower()
+    
+    return staff_pay_types[['staff_name', 'Pay_Type', 'staff_name_lower']]
 
 
 # --- Run App ---
@@ -165,7 +194,8 @@ if staff_file and sales_file:
     
     if st.button("Run Reconciliation"):
         try:
-            with st.spinner('Processing records with Smart Matching and Corrected Travel Fee Logic...'):
+            with st.spinner('Processing records with Smart Matching and Updated Summary Logic...'):
+                
                 # 1. Load Data
                 df_staff = pd.read_csv(staff_file, encoding='latin1', engine='python', on_bad_lines='skip')
                 df_sales = pd.read_csv(sales_file, encoding='latin1', engine='python', on_bad_lines='skip')
@@ -177,17 +207,24 @@ if staff_file and sales_file:
                 df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
                 
                 # Positional Fix for Staff Date
-                if len(df_staff.columns) > 0:
+                if len(df_staff.columns) > 0 and 'date' not in df_staff.columns:
                     df_staff = df_staff.rename(columns={df_staff.columns[0]: 'date'}, errors='ignore')
 
-                # Clean Travel Fee/Outside Clinic Columns
+                # Clean numeric/categorical columns
                 df_staff['travel_fee_used'] = pd.to_numeric(df_staff['travel_fee_used'], errors='coerce').fillna(0)
                 df_staff['outside_clinic'] = df_staff['outside_clinic'].astype(str).str.strip().str.lower()
-                df_staff['charged_amount'] = pd.to_numeric(df_staff['charged_amount'], errors='coerce').fillna(0) # Ensure charged_amount is numeric
-
-                # Determine Staff Pay Type and Merge
+                df_staff['charged_amount'] = pd.to_numeric(df_staff['charged_amount'], errors='coerce').fillna(0) 
+                
+                # Determine Staff Pay Type and Create Pay Type Map
                 df_pay_types = get_staff_pay_types(df_staff.copy())
-                df_staff = pd.merge(df_staff, df_pay_types, on='staff_name', how='left')
+                # Create a map: lower_staff_name -> Pay_Type for quick lookups
+                pay_type_map = df_pay_types.set_index('staff_name_lower')['Pay_Type'].to_dict()
+                
+                # Merge Pay Type onto staff data
+                df_staff['staff_name_lower'] = df_staff['staff_name'].str.lower()
+                df_staff = pd.merge(df_staff, df_pay_types[['staff_name_lower', 'Pay_Type']], on='staff_name_lower', how='left')
+                df_staff.drop(columns=['staff_name_lower'], inplace=True)
+
 
                 # Create Unique IDs (Crucial for 1-to-1 matching)
                 df_staff['staff_id'] = df_staff.index
@@ -195,19 +232,23 @@ if staff_file and sales_file:
 
                 # Process Sales Dates & Names
                 df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
-                df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], utc=True)
-                df_sales['dt_local'] = df_sales['dt_obj'].dt.tz_convert('America/Vancouver')
-                df_sales['date_str'] = df_sales['dt_local'].dt.normalize().astype(str).str[:10]
+                df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], errors='coerce')
+                # Use a reasonable default time zone conversion if dates are present
+                if not df_sales['dt_obj'].dt.tz:
+                    df_sales['dt_obj'] = df_sales['dt_obj'].dt.tz_localize('UTC').dt.tz_convert('America/Vancouver')
+                df_sales['date_str'] = df_sales['dt_obj'].dt.normalize().astype(str).str[:10]
                 df_sales['patient_norm'] = df_sales['patient'].apply(clean_name_string) 
                 df_sales['expected_hours'] = df_sales['item'].apply(extract_expected_hours)
+                df_sales['staff_member_lower'] = df_sales['staff_member'].astype(str).str.lower()
+
 
                 # Process Staff Dates & Names
-                df_staff['date_obj'] = pd.to_datetime(df_staff['date'])
+                df_staff['date_obj'] = pd.to_datetime(df_staff['date'], errors='coerce')
                 df_staff['date_str'] = df_staff['date_obj'].dt.normalize().astype(str).str[:10]
                 df_staff['extracted_name'] = df_staff['notes'].apply(extract_name)
                 df_staff['name_norm'] = df_staff['extracted_name'].apply(clean_name_string)
 
-                # --- MATCHING LOGIC (Same as before) ---
+                # --- MATCHING LOGIC ---
                 potential_matches = pd.merge(
                     df_staff, df_sales, left_on=['name_norm'], right_on=['patient_norm'], 
                     how='outer', suffixes=('_staff', '_sales')
@@ -221,7 +262,17 @@ if staff_file and sales_file:
                 potential_matches['date_diff'] = potential_matches.apply(get_date_diff, axis=1)
                 candidates = potential_matches[potential_matches['date_diff'] <= 1].copy()
                 candidates['service_score'] = candidates.apply(calculate_keyword_score, axis=1)
-                candidates = candidates.sort_values(by=['service_score', 'date_diff'], ascending=[False, True])
+                
+                # Use a composite score: service score + (100 - date_diff) - 10 if names are very different
+                def get_match_score(row):
+                    similarity = SequenceMatcher(None, row['name_norm'], row['patient_norm']).ratio()
+                    score = row['service_score'] + (100 - row['date_diff'])
+                    if similarity < 0.7:
+                        score -= 20 # Penalize low name similarity
+                    return score
+
+                candidates['match_score'] = candidates.apply(get_match_score, axis=1)
+                candidates = candidates.sort_values(by='match_score', ascending=False)
                 
                 matched_staff_ids = set()
                 matched_sales_ids = set()
@@ -229,7 +280,7 @@ if staff_file and sales_file:
 
                 for _, row in candidates.iterrows():
                     sid, slid = row['staff_id'], row['sales_id']
-                    if sid not in matched_staff_ids and slid not in matched_sales_ids:
+                    if pd.notna(sid) and pd.notna(slid) and sid not in matched_staff_ids and slid not in matched_sales_ids:
                         match_dict = row.to_dict()
                         match_dict['Status'] = 'Matched'
                         match_dict['Match_Type'] = f"Match (Diff: {row['date_diff']} days)"
@@ -243,15 +294,26 @@ if staff_file and sales_file:
                     new_row = row.to_dict()
                     if 'date_str' in new_row: new_row['date_str_staff'] = new_row.pop('date_str')
                     new_row['Status'], new_row['Match_Type'] = 'In Staff Log Only (Missing in Sales)', 'N/A'
-                    new_row['invoice_date'], new_row['patient'], new_row['item'], new_row['subtotal'], new_row['expected_hours'] = None, None, None, None, None
+                    # Populate necessary columns with None/NaN to allow for correct DataFrame creation
+                    new_row.update({'invoice_date': None, 'patient': None, 'item': None, 'subtotal': None, 'expected_hours': None})
                     final_rows.append(new_row)
 
                 unmatched_sales = df_sales[~df_sales['sales_id'].isin(matched_sales_ids)].copy()
                 for _, row in unmatched_sales.iterrows():
                     new_row = row.to_dict()
                     new_row['date_str_sales'] = new_row.pop('date_str')
-                    new_row['date_str_staff'], new_row['date'], new_row['extracted_name'], new_row['notes'], new_row['charged_amount'], new_row['direct_hrs'] = None, None, None, None, None, None
-                    new_row['Pay_Type'], new_row['outside_clinic'], new_row['travel_fee_used'] = None, None, None 
+                    
+                    # *** THE CRITICAL FIX FOR SUMMARY METRICS ***
+                    # Look up the Pay_Type using the staff member name in the sales record
+                    sales_staff_lower = new_row.get('staff_member_lower')
+                    inferred_pay_type = pay_type_map.get(sales_staff_lower, 'Unknown')
+
+                    # Populate necessary staff columns with None/NaN
+                    new_row.update({
+                        'date_str_staff': None, 'date': None, 'extracted_name': None, 'notes': None, 
+                        'charged_amount': None, 'direct_hrs': None, 'outside_clinic': None, 
+                        'travel_fee_used': None, 'Pay_Type': inferred_pay_type  # Set the INFERRED Pay_Type
+                    })
                     new_row['Status'], new_row['Match_Type'] = 'In Sales Record Only (Missing in Log)', 'N/A'
                     final_rows.append(new_row)
 
@@ -287,7 +349,7 @@ if staff_file and sales_file:
                 available_cols = [c for c in report_cols if c in final_df.columns]
                 final_report = final_df[available_cols].rename(columns=rename_map)
 
-                # --- METRICS CALCULATION (Updated for Hourly Critical Errors) ---
+                # --- METRICS CALCULATION (Updated to use Pay_Type from final_report) ---
                 
                 df_hourly = final_report[final_report['Staff_Pay_Type'] == 'Hourly'].copy()
                 df_percentage = final_report[final_report['Staff_Pay_Type'] == 'Percentage'].copy()
@@ -303,12 +365,12 @@ if staff_file and sales_file:
                             (df['Status'] == 'Matched') & 
                             (df['Hours_Validation_Status'].str.startswith('Mismatch', na=False))
                         ])
-                        # 2. Travel Fee Data Entry Error (Staff recorded fee, Sales did not)
+                        # 2. Travel Fee/Charged Amount Mismatch Errors
                         travel_fee_error = len(df[
                             (df['Status'] == 'Matched') & 
-                            (df['Amount_Status'].str.contains('Staff Log indicates Home Session', na=False))
+                            (df['Amount_Status'].str.contains('Mismatch', na=False))
                         ])
-                        # Sum both for the critical mismatch metric
+                        # We sum all amount/hours mismatches for critical error
                         error_count = hours_mismatch + travel_fee_error
                     
                     elif pay_type == 'Percentage':
@@ -334,7 +396,7 @@ if staff_file and sales_file:
                 st.markdown("#### Hourly Rate Staff Summary")
                 col1, col2, col3, col4 = st.columns(4) 
                 col1.metric("Total Matches (1-to-1)", h_matched)
-                col2.metric("**Critical Mismatch Errors (Hrs + Travel Fee)**", h_error, help="Includes errors where Direct Hours mismatch AND errors where Staff recorded a travel fee but the Sales Subtotal did not.") 
+                col2.metric("**Critical Mismatch Errors (Hrs + Amount)**", h_error, help="Includes errors where Direct Hours mismatch AND general amount mismatches (including travel fee discrepancies).") 
                 col3.metric("In Staff Log Only", h_staff_only)
                 col4.metric("In Sales Record Only", h_sales_only)
 
@@ -346,7 +408,7 @@ if staff_file and sales_file:
                 col1.metric("Total Matches (1-to-1)", p_matched)
                 col2.metric("**Amount Mismatch Errors**", p_error, help="Includes general Subtotal mismatches and errors related to missing/mismatched Travel Fees.") 
                 col3.metric("In Staff Log Only", p_staff_only)
-                col4.metric("In Sales Record Only", p_sales_only)
+                col4.metric("**In Sales Record Only**", p_sales_only, help="This now includes entries like the 'Xyla Thomson - No Show' correctly attributed to a Percentage Pay staff member.")
                 
                 st.markdown("---")
 
@@ -357,7 +419,7 @@ if staff_file and sales_file:
                 st.download_button(
                     label="📥 Download Report as CSV",
                     data=csv,
-                    file_name='Reconciliation_Report_Dual_Pay_Travel_Final.csv',
+                    file_name='Reconciliation_Report_Fixed_Summary.csv',
                     mime='text/csv',
                 )
 

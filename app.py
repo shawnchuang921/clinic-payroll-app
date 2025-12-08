@@ -4,16 +4,17 @@ import sqlite3
 import re
 import io
 import datetime
+import numpy as np
 from difflib import SequenceMatcher
 
 # --- 1. DATABASE SETUP & MANAGEMENT ---
 
 def init_db():
-    """Initializes the SQLite database with tables and default users."""
+    """Initializes the SQLite database and handles schema migrations."""
     conn = sqlite3.connect('clinic.db')
     c = conn.cursor()
     
-    # Table: Users (Login Info)
+    # Table: Users
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY,
                     password TEXT,
@@ -21,16 +22,24 @@ def init_db():
                     staff_name TEXT
                 )''')
     
-    # Table: Staff Config (Pay Rates & Details)
+    # Table: Staff Config (Updated for Indirect Rate)
     c.execute('''CREATE TABLE IF NOT EXISTS staff_config (
                     staff_name TEXT PRIMARY KEY,
                     position TEXT,
                     pay_type TEXT, 
-                    base_rate REAL,
+                    base_rate REAL, 
                     travel_fee REAL
                 )''') 
     
-    # Table: Staff Logs (The actual entries)
+    # --- MIGRATION: Check if 'indirect_rate' exists, if not, add it ---
+    try:
+        c.execute("SELECT indirect_rate FROM staff_config LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column doesn't exist, add it
+        c.execute("ALTER TABLE staff_config ADD COLUMN indirect_rate REAL DEFAULT 0.0")
+        conn.commit()
+
+    # Table: Staff Logs
     c.execute('''CREATE TABLE IF NOT EXISTS staff_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT,
@@ -56,20 +65,26 @@ def init_db():
         ]
         c.executemany("INSERT INTO users VALUES (?,?,?,?)", users)
         
+        # Default Configs (base_rate is Direct Rate, indirect_rate is new)
         configs = [
-            ('Leonardo Tam', 'OT', 'Percentage', 50.0, 20.0),
-            ('Julia Kwan', 'OT', 'Hourly', 80.0, 20.0),
-            ('Shawn Chuang', 'Admin', 'Hourly', 0.0, 0.0)
+            ('Leonardo Tam', 'OT', 'Percentage', 50.0, 20.0, 0.0),
+            ('Julia Kwan', 'OT', 'Hourly', 80.0, 20.0, 50.0), # Example: $80 Direct, $50 Indirect
+            ('Shawn Chuang', 'Admin', 'Hourly', 0.0, 0.0, 0.0)
         ]
-        c.executemany("INSERT INTO staff_config VALUES (?,?,?,?,?)", configs)
+        c.executemany("INSERT INTO staff_config (staff_name, position, pay_type, base_rate, travel_fee, indirect_rate) VALUES (?,?,?,?,?,?)", configs)
         conn.commit()
+    
     conn.close()
 
 # --- DB Access Helpers ---
 
 def get_staff_config(staff_name):
     conn = sqlite3.connect('clinic.db')
-    df = pd.read_sql_query("SELECT * FROM staff_config WHERE staff_name = ?", conn, params=(staff_name,))
+    # Fetch all columns including the new indirect_rate
+    try:
+        df = pd.read_sql_query("SELECT * FROM staff_config WHERE staff_name = ?", conn, params=(staff_name,))
+    except:
+        return None
     conn.close()
     return df.iloc[0] if not df.empty else None
 
@@ -78,12 +93,6 @@ def get_all_staff_names():
     df = pd.read_sql_query("SELECT staff_name FROM staff_config", conn)
     conn.close()
     return df['staff_name'].tolist()
-
-def get_user_info(staff_name):
-    conn = sqlite3.connect('clinic.db')
-    df = pd.read_sql_query("SELECT * FROM users WHERE staff_name = ?", conn, params=(staff_name,))
-    conn.close()
-    return df.iloc[0] if not df.empty else None
 
 def save_log_entry(data):
     conn = sqlite3.connect('clinic.db')
@@ -117,16 +126,15 @@ def delete_log_entry(log_id):
     conn.commit()
     conn.close()
 
-def update_staff_info(original_name, new_role, new_pay_type, new_rate, new_travel, new_password=None):
+def update_staff_info(original_name, new_role, new_pay_type, new_direct_rate, new_indirect_rate, new_travel, new_password=None):
     conn = sqlite3.connect('clinic.db')
     c = conn.cursor()
-    # Update Config
+    # Update Config (base_rate = direct_rate)
     c.execute('''UPDATE staff_config SET 
-                 position=?, pay_type=?, base_rate=?, travel_fee=?
+                 position=?, pay_type=?, base_rate=?, indirect_rate=?, travel_fee=?
                  WHERE staff_name=?''', 
-              (new_role, new_pay_type, new_rate, new_travel, original_name))
+              (new_role, new_pay_type, new_direct_rate, new_indirect_rate, new_travel, original_name))
     
-    # Update Password if provided
     if new_password:
         c.execute("UPDATE users SET password=? WHERE staff_name=?", (new_password, original_name))
     
@@ -164,14 +172,12 @@ def run_reconciliation_logic(df_staff, df_sales):
 
     def extract_name(note):
         if not isinstance(note, str): return ""
-        # Try capturing Name at start
         pattern = r'^(.*?)\s+\d{1,2}(?::\d{2})?-\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)?.*$'
         match = re.search(pattern, note, flags=re.IGNORECASE)
         if match:
             extracted = match.group(1).strip()
             extracted = re.sub(r'\s+(OT|PT|SLP|Assessment|Intervention|Report|Consultation|Session|Writing)\s*$', '', extracted, flags=re.IGNORECASE)
             return extracted.strip()
-        # Fallback
         pattern = r'\s+\d{1,2}(?::\d{2})?-\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)?.*$'
         clean_name = re.sub(pattern, '', note, flags=re.IGNORECASE)
         return clean_name.strip()
@@ -212,14 +218,25 @@ def run_reconciliation_logic(df_staff, df_sales):
         expected_hours = row.get('expected_hours', 0)
         outside_clinic = str(row.get('outside_clinic', 'no')).strip().lower()
         
+        # Retrieve the staff's specific Direct Rate (merged earlier)
+        # Default to 160.0 if missing, but we should have it now.
+        staff_direct_rate = row.get('Direct_Rate_Config', 160.0) 
+        if pd.isna(staff_direct_rate) or staff_direct_rate == 0:
+            staff_direct_rate = 160.0 # Safety fallback
+        
         staff_total_charge = staff_charge + travel_fee
-        expected_base_price = expected_hours * 160.0
+        
+        # Calculate dynamic base price using the STAFF'S specific direct rate
+        expected_base_price = expected_hours * staff_direct_rate
+        
         staff_flags_home_session = (outside_clinic == 'yes') and (travel_fee > 0)
 
+        # 1. Primary Check
         if round(staff_total_charge, 2) == round(sales_subtotal, 2):
             if staff_flags_home_session: return 'Match (Inc. Travel Fee)'
             return 'Match'
         
+        # 2. Travel Fee Mismatch Scenarios
         if staff_flags_home_session:
             if round(sales_subtotal, 2) == round(expected_base_price, 2):
                 return f'Mismatch: Staff Log indicates Home Session (+$20), but Sales Subtotal (${sales_subtotal}) is missing Travel Fee.'
@@ -227,30 +244,36 @@ def run_reconciliation_logic(df_staff, df_sales):
                  return f'Mismatch: Staff Log Charged Amount is $0, but Sales is ${sales_subtotal}. (Possible Travel Fee Error)'
 
         if not staff_flags_home_session and travel_fee == 0:
+            # Check against Staff Rate + 20
             if round(sales_subtotal, 2) == round(expected_base_price + 20.0, 2):
                  return f'Mismatch: Sales Subtotal (${sales_subtotal}) suggests Home Session (+$20) not reflected in Staff Log.'
 
         return f'Mismatch: Staff Total Charge (${staff_total_charge}) != Sales Subtotal (${sales_subtotal})'
 
-    # --- MAIN LOGIC ---
-    # 1. Prepare Staff Data (Already loaded from DB, just clean columns)
+    # --- MAIN PROCESSING ---
+    
+    # 1. Staff Data Prep
     df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
     
-    # Get Pay Types from DB Config
+    # 2. Fetch Config & Merge Rates
     conn = sqlite3.connect('clinic.db')
-    df_config = pd.read_sql_query("SELECT staff_name, pay_type FROM staff_config", conn)
+    # Fetch base_rate (Direct) and pay_type
+    df_config = pd.read_sql_query("SELECT staff_name, pay_type, base_rate FROM staff_config", conn)
     conn.close()
     
-    # Create Pay Type Map
     df_config['staff_name_lower'] = df_config['staff_name'].str.lower()
-    pay_type_map = df_config.set_index('staff_name_lower')['pay_type'].to_dict()
     
-    # Merge Pay Type to Staff Log
+    # Create maps
+    pay_type_map = df_config.set_index('staff_name_lower')['pay_type'].to_dict()
+    rate_map = df_config.set_index('staff_name_lower')['base_rate'].to_dict()
+    
+    # Merge Info to Staff Log
     df_staff['staff_name_lower'] = df_staff['staff_name'].astype(str).str.lower()
     df_staff['Pay_Type'] = df_staff['staff_name_lower'].map(pay_type_map).fillna('Unknown')
+    df_staff['Direct_Rate_Config'] = df_staff['staff_name_lower'].map(rate_map).fillna(160.0)
     df_staff.drop(columns=['staff_name_lower'], inplace=True)
 
-    # 2. Prepare Sales Data
+    # 3. Sales Data Prep
     df_sales.columns = df_sales.columns.str.strip().str.replace(' ', '_').str.lower()
     df_sales = df_sales.dropna(subset=['patient', 'invoice_date'])
     df_sales['dt_obj'] = pd.to_datetime(df_sales['invoice_date'], errors='coerce')
@@ -261,7 +284,7 @@ def run_reconciliation_logic(df_staff, df_sales):
     df_sales['expected_hours'] = df_sales['item'].apply(extract_expected_hours)
     df_sales['staff_member_lower'] = df_sales['staff_member'].astype(str).str.lower()
 
-    # 3. Staff Data Prep
+    # 4. Standardize Staff Log
     df_staff['date_obj'] = pd.to_datetime(df_staff['date'], errors='coerce')
     df_staff['date_str'] = df_staff['date_obj'].dt.normalize().astype(str).str[:10]
     df_staff['extracted_name'] = df_staff['client_name'] 
@@ -270,7 +293,7 @@ def run_reconciliation_logic(df_staff, df_sales):
     df_staff['charged_amount'] = pd.to_numeric(df_staff['charged_amount'], errors='coerce').fillna(0)
     df_staff['direct_hrs'] = pd.to_numeric(df_staff['direct_hrs'], errors='coerce').fillna(0)
 
-    # 4. Matching
+    # 5. Matching Logic
     df_staff['staff_id'] = df_staff.index
     df_sales['sales_id'] = df_sales.index
 
@@ -325,11 +348,15 @@ def run_reconciliation_logic(df_staff, df_sales):
         new_row = row.to_dict()
         new_row['date_str_sales'] = new_row.pop('date_str')
         inferred_pay_type = pay_type_map.get(new_row.get('staff_member_lower'), 'Unknown')
+        
+        # Also grab the rate for the inferred staff to keep columns consistent
+        inferred_rate = rate_map.get(new_row.get('staff_member_lower'), 160.0)
+
         new_row['Staff_Name_Final'] = row['staff_member']
         new_row.update({
             'date_str_staff': None, 'date': None, 'extracted_name': None, 'notes': None, 
             'charged_amount': None, 'direct_hrs': None, 'outside_clinic': None, 
-            'travel_fee_used': None, 'Pay_Type': inferred_pay_type 
+            'travel_fee_used': None, 'Pay_Type': inferred_pay_type, 'Direct_Rate_Config': inferred_rate
         })
         new_row['Status'], new_row['Match_Type'] = 'In Sales Record Only (Missing in Log)', 'N/A'
         final_rows.append(new_row)
@@ -371,7 +398,14 @@ def staff_entry_page():
         st.error("Configuration not found. Please contact Admin.")
         return
 
-    st.info(f"**Position:** {config['position']} | **Pay Structure:** {config['pay_type']}")
+    # Use 'base_rate' from DB as Direct Rate
+    direct_rate = config['base_rate']
+    # Use 'indirect_rate' from DB, default to 0.0 if not present (migration handling)
+    indirect_rate = config['indirect_rate'] if 'indirect_rate' in config else 0.0
+
+    st.info(f"**Position:** {config['position']} | **Pay Type:** {config['pay_type']}")
+    if config['pay_type'] == 'Hourly':
+        st.caption(f"Rates: ${direct_rate}/hr (Direct) | ${indirect_rate}/hr (Indirect)")
     
     with st.form("staff_log_form"):
         col1, col2 = st.columns(2)
@@ -396,10 +430,13 @@ def staff_entry_page():
                 travel_fee_val = config['travel_fee'] if is_home_session else 0.0
                 outside_val = "Yes" if is_home_session else "No"
                 total_pay = 0.0
+                
                 if config['pay_type'] == 'Hourly':
-                    total_pay = ((direct_hrs + indirect_hrs) * config['base_rate']) + travel_fee_val
+                    # UPDATED FORMULA: Separate rates for direct and indirect
+                    total_pay = (direct_hrs * direct_rate) + (indirect_hrs * indirect_rate) + travel_fee_val
                 elif config['pay_type'] == 'Percentage':
-                    total_pay = (charged_amount * (config['base_rate'] / 100)) + travel_fee_val
+                    # base_rate is treated as percentage
+                    total_pay = (charged_amount * (direct_rate / 100)) + travel_fee_val
                 
                 log_data = {
                     'date': date_input.strftime('%Y-%m-%d'), 'staff_name': st.session_state['staff_name'],
@@ -423,7 +460,6 @@ def admin_page():
     with tab1:
         st.subheader("Run Payroll Reconciliation")
         
-        # --- Scoped Reconciliation Filters ---
         col1, col2 = st.columns(2)
         all_staff = ["All Staff"] + get_all_staff_names()
         selected_staff = col1.selectbox("Filter by Staff", all_staff)
@@ -438,7 +474,6 @@ def admin_page():
             if not sales_file:
                 st.error("Please upload a Sales Record CSV.")
             else:
-                # 1. Get Staff Data from DB with Filters
                 df_staff_db = get_filtered_logs(selected_staff, start_date, end_date)
                 
                 if df_staff_db.empty:
@@ -448,7 +483,6 @@ def admin_page():
                         df_sales_csv = pd.read_csv(sales_file, encoding='latin1', engine='python', on_bad_lines='skip')
                         final_report = run_reconciliation_logic(df_staff_db, df_sales_csv)
                         
-                        # --- METRICS ---
                         df_hourly = final_report[final_report['Pay_Type'] == 'Hourly']
                         df_percentage = final_report[final_report['Pay_Type'] == 'Percentage']
                         
@@ -505,22 +539,28 @@ def admin_page():
                 new_pay_type = c2.selectbox("Pay Type", ["Hourly", "Percentage"], index=0 if config['pay_type']=='Hourly' else 1)
                 
                 c3, c4 = st.columns(2)
-                new_rate = c3.number_input("Base Rate (or %)", value=config['base_rate'])
-                new_travel = c4.number_input("Travel Fee ($)", value=config['travel_fee'])
+                # Display 'Base Rate' label dynamically
+                rate_label = "Direct Rate ($/hr)" if new_pay_type == 'Hourly' else "Percentage Share (%)"
+                new_direct_rate = c3.number_input(rate_label, value=config['base_rate'])
+                
+                # New Indirect Rate Field
+                indirect_val = config['indirect_rate'] if 'indirect_rate' in config else 0.0
+                new_indirect_rate = c4.number_input("Indirect Rate ($/hr)", value=indirect_val)
+                
+                new_travel = st.number_input("Travel Fee ($)", value=config['travel_fee'])
                 
                 st.markdown("---")
                 st.markdown("**🔐 Security**")
                 new_password = st.text_input("New Password (leave blank to keep current)", type="password")
                 
                 if st.form_submit_button("Update Staff Info"):
-                    update_staff_info(selected_staff_edit, new_role, new_pay_type, new_rate, new_travel, new_password if new_password else None)
+                    update_staff_info(selected_staff_edit, new_role, new_pay_type, new_direct_rate, new_indirect_rate, new_travel, new_password if new_password else None)
                     st.success(f"Updated information for {selected_staff_edit}")
                     st.rerun()
 
     with tab3:
         st.subheader("View & Edit Staff Logs")
         
-        # --- Filters for Editing ---
         col1, col2 = st.columns(2)
         filter_staff = col1.selectbox("Filter by Staff", ["All Staff"] + get_all_staff_names(), key="log_filter_staff")
         filter_date = col2.date_input("Filter by Date (Start)", datetime.date.today() - datetime.timedelta(days=30))
@@ -532,9 +572,7 @@ def admin_page():
         log_id_to_edit = st.number_input("Enter Log ID to Edit (See 'id' column above)", min_value=0, step=1)
         
         if log_id_to_edit > 0:
-            # Check if valid ID
             if log_id_to_edit in df_logs['id'].values:
-                # Get current values
                 current_row = df_logs[df_logs['id'] == log_id_to_edit].iloc[0]
                 
                 with st.form("edit_log_form"):
@@ -553,8 +591,6 @@ def admin_page():
                     e_outside = st.selectbox("Outside Clinic?", ["Yes", "No"], index=0 if current_row['outside_clinic']=='Yes' else 1)
                     e_notes = st.text_area("Notes", current_row['notes'])
                     
-                    # Recalc total pay helper
-                    # (Simple calc logic for edit - ideally fetch rate but assuming manual override allowed)
                     e_total = st.number_input("Total Pay (Override if needed)", value=float(current_row['total_pay']))
                     
                     c_del, c_save = st.columns([1, 4])

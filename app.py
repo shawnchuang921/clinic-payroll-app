@@ -66,7 +66,7 @@ def init_db():
         ]
         c.executemany("INSERT INTO users VALUES (?,?,?,?)", users)
         
-        # Default Configs (base_rate is Direct Rate, indirect_rate is new)
+        # Default Configs (base_rate is Direct Rate or Percentage Share, indirect_rate is new)
         configs = [
             ('Leonardo Tam', 'OT', 'Percentage', 50.0, 20.0, 0.0), # $50% Share, $20 Travel
             ('Julia Kwan', 'OT', 'Hourly', 80.0, 20.0, 50.0), # $80 Direct, $50 Indirect, $20 Travel
@@ -151,6 +151,44 @@ def update_staff_info(original_name, new_role, new_pay_type, new_direct_rate, ne
     conn.commit()
     conn.close()
 
+def add_new_staff(username, password, staff_name, position, pay_type, direct_rate, indirect_rate, travel_fee):
+    """Inserts a new staff member into the users and staff_config tables."""
+    conn = sqlite3.connect('clinic.db')
+    c = conn.cursor()
+    try:
+        # 1. Insert into users table
+        c.execute("INSERT INTO users VALUES (?,?,?,?)", (username, password, 'staff', staff_name))
+        
+        # 2. Insert into staff_config table
+        c.execute('''INSERT INTO staff_config (staff_name, position, pay_type, base_rate, travel_fee, indirect_rate) 
+                     VALUES (?,?,?,?,?,?)''', 
+                  (staff_name, position, pay_type, direct_rate, travel_fee, indirect_rate))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        # Handles duplicate username or staff_name (primary keys)
+        conn.close()
+        return False
+
+def delete_staff(staff_name):
+    """Deletes a staff member and all associated records."""
+    conn = sqlite3.connect('clinic.db')
+    c = conn.cursor()
+    
+    # 1. Delete from users
+    c.execute("DELETE FROM users WHERE staff_name=?", (staff_name,))
+    
+    # 2. Delete from staff_config
+    c.execute("DELETE FROM staff_config WHERE staff_name=?", (staff_name,))
+    
+    # 3. Delete from staff_logs (to clean up)
+    c.execute("DELETE FROM staff_logs WHERE staff_name=?", (staff_name,))
+    
+    conn.commit()
+    conn.close()
+    
 def get_filtered_logs(staff_filter=None, start_date=None, end_date=None):
     conn = sqlite3.connect('clinic.db')
     query = "SELECT * FROM staff_logs WHERE 1=1"
@@ -489,6 +527,7 @@ def staff_entry_page():
     # Filters (Point 3)
     col_f1, col_f2, col_f3 = st.columns(3)
     # Default filter to the last 30 days
+    today = datetime.date.today()
     default_start_date = today - datetime.timedelta(days=30)
     filter_start_date = col_f1.date_input("Start Date", default_start_date, key="staff_filter_start_date")
     filter_end_date = col_f2.date_input("End Date", today, key="staff_filter_end_date")
@@ -641,13 +680,50 @@ def admin_page():
 
     with tab2:
         st.subheader("Manage Staff Information")
-        st.markdown("Edit positions, rates, and **reset passwords** here.")
         
+        # --- ADD STAFF SECTION ---
+        st.markdown("### ➕ Add New Staff Member")
+        with st.form("add_staff_form"):
+            col_n1, col_n2 = st.columns(2)
+            new_staff_name = col_n1.text_input("Staff Full Name (Must be Unique)", key="new_staff_name")
+            new_login_id = col_n2.text_input("Login ID (Must be Unique)", key="new_login_id")
+            
+            new_password = st.text_input("Default Password", type="password", key="new_password")
+            
+            c_r1, c_r2 = st.columns(2)
+            new_role = c_r1.text_input("Position/Role", value="OT", key="new_position")
+            new_pay_type = c_r2.selectbox("Pay Type", ["Hourly", "Percentage"], key="new_pay_type")
+
+            c_r3, c_r4 = st.columns(2)
+            rate_label = "Direct Rate ($/hr or %)"
+            new_direct_rate = c_r3.number_input(rate_label, value=80.0, key="new_direct_rate")
+            new_indirect_rate = c_r4.number_input("Indirect Rate ($/hr)", value=0.0, key="new_indirect_rate")
+            
+            new_travel = st.number_input("Travel Fee ($)", value=20.0, key="new_travel")
+            
+            if st.form_submit_button("Create New Staff"):
+                if not new_staff_name or not new_login_id or not new_password:
+                    st.error("Please fill in Staff Name, Login ID, and Default Password.")
+                else:
+                    success = add_new_staff(new_login_id, new_password, new_staff_name, new_role, 
+                                            new_pay_type, new_direct_rate, new_indirect_rate, new_travel)
+                    if success:
+                        st.success(f"Staff member '{new_staff_name}' created successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to add staff. Staff Name or Login ID might already exist.")
+        
+        st.markdown("---")
+
+        # --- EDIT / DELETE STAFF SECTION ---
+        st.markdown("### ✏️ Edit or Remove Existing Staff")
         staff_list = get_all_staff_names()
-        selected_staff_edit = st.selectbox("Select Staff to Edit", ["Select..."] + staff_list)
+        selected_staff_edit = st.selectbox("Select Staff to Edit", ["Select..."] + staff_list, key="admin_select_staff_edit")
         
         if selected_staff_edit != "Select...":
             config = get_staff_config(selected_staff_edit)
+            
+            st.markdown(f"#### Configuration for: **{selected_staff_edit}**")
             
             with st.form("edit_staff_form"):
                 c1, c2 = st.columns(2)
@@ -655,11 +731,9 @@ def admin_page():
                 new_pay_type = c2.selectbox("Pay Type", ["Hourly", "Percentage"], index=0 if config['pay_type']=='Hourly' else 1)
                 
                 c3, c4 = st.columns(2)
-                # Display 'Base Rate' label dynamically
-                rate_label = "Direct Rate ($/hr)" if new_pay_type == 'Hourly' else "Percentage Share (%)"
+                rate_label = "Direct Rate ($/hr or %)"
                 new_direct_rate = c3.number_input(rate_label, value=config['base_rate'])
                 
-                # New Indirect Rate Field
                 indirect_val = config['indirect_rate'] if 'indirect_rate' in config else 0.0
                 new_indirect_rate = c4.number_input("Indirect Rate ($/hr)", value=indirect_val)
                 
@@ -669,10 +743,32 @@ def admin_page():
                 st.markdown("**🔐 Security**")
                 new_password = st.text_input("New Password (leave blank to keep current)", type="password")
                 
+                c_del_col, c_update_col = st.columns([1, 4])
+                
+                # DELETE BUTTON WITH CONFIRMATION
+                if c_del_col.button(f"🗑️ Delete Staff"):
+                    st.session_state['delete_candidate'] = selected_staff_edit
+                    st.session_state['confirm_delete'] = True
+
                 if st.form_submit_button("Update Staff Info"):
                     update_staff_info(selected_staff_edit, new_role, new_pay_type, new_direct_rate, new_indirect_rate, new_travel, new_password if new_password else None)
                     st.success(f"Updated information for {selected_staff_edit}")
                     st.rerun()
+                    
+            # Confirmation dialogue (outside the form so the form button doesn't trigger a rerun before confirmation)
+            if 'confirm_delete' in st.session_state and st.session_state['confirm_delete'] and st.session_state['delete_candidate'] == selected_staff_edit:
+                st.error(f"⚠️ Are you absolutely sure you want to delete **{selected_staff_edit}**? This action is permanent and will delete ALL associated logs.")
+                col_confirm1, col_confirm2 = st.columns(2)
+                if col_confirm1.button("✅ YES, DELETE STAFF PERMANENTLY", key="final_delete_confirm"):
+                    delete_staff(selected_staff_edit)
+                    st.session_state['confirm_delete'] = False
+                    st.session_state['delete_candidate'] = None
+                    st.success(f"Staff member {selected_staff_edit} and all their logs have been deleted.")
+                    st.rerun()
+                if col_confirm2.button("❌ Cancel Deletion", key="cancel_delete"):
+                    st.session_state['confirm_delete'] = False
+                    st.session_state['delete_candidate'] = None
+                    st.info("Deletion cancelled.")
 
     with tab3:
         st.subheader("View & Edit Staff Logs (Admin Access)")
@@ -743,6 +839,10 @@ init_db()
 
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
+if 'confirm_delete' not in st.session_state:
+    st.session_state['confirm_delete'] = False
+if 'delete_candidate' not in st.session_state:
+    st.session_state['delete_candidate'] = None
 
 if not st.session_state['logged_in']:
     login_page()
@@ -751,6 +851,8 @@ else:
         st.write(f"Logged in as: **{st.session_state['staff_name']}**")
         if st.button("Logout"):
             st.session_state['logged_in'] = False
+            st.session_state['confirm_delete'] = False
+            st.session_state['delete_candidate'] = None
             st.rerun()
     
     if st.session_state['user_role'] == 'admin':

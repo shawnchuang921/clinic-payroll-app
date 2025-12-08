@@ -146,8 +146,15 @@ def update_staff_info(original_name, new_role, new_pay_type, new_direct_rate, ne
               (new_role, new_pay_type, new_direct_rate, new_indirect_rate, new_travel, original_name))
     
     if new_password:
-        c.execute("UPDATE users SET password=? WHERE staff_name=?", (new_password, original_name))
-    
+        # NOTE: In a real app, hash and salt the password before storing!
+        user_info = pd.read_sql_query("SELECT username, role FROM users WHERE staff_name=?", conn, params=(original_name,))
+        if not user_info.empty:
+            username = user_info.iloc[0]['username']
+            role = user_info.iloc[0]['role']
+            # Re-insert to ensure we update the correct user tied to staff_name
+            c.execute("DELETE FROM users WHERE staff_name=?", (original_name,))
+            c.execute("INSERT INTO users VALUES (?,?,?,?)", (username, new_password, role, original_name))
+            
     conn.commit()
     conn.close()
 
@@ -157,6 +164,7 @@ def add_new_staff(username, password, staff_name, position, pay_type, direct_rat
     c = conn.cursor()
     try:
         # 1. Insert into users table
+        # NOTE: In a real app, hash and salt the password before storing!
         c.execute("INSERT INTO users VALUES (?,?,?,?)", (username, password, 'staff', staff_name))
         
         # 2. Insert into staff_config table
@@ -725,6 +733,7 @@ def admin_page():
             
             st.markdown(f"#### Configuration for: **{selected_staff_edit}**")
             
+            # --- EDIT STAFF FORM ---
             with st.form("edit_staff_form"):
                 c1, c2 = st.columns(2)
                 new_role = c1.text_input("Position", value=config['position'])
@@ -743,19 +752,18 @@ def admin_page():
                 st.markdown("**🔐 Security**")
                 new_password = st.text_input("New Password (leave blank to keep current)", type="password")
                 
-                c_del_col, c_update_col = st.columns([1, 4])
-                
-                # DELETE BUTTON WITH CONFIRMATION
-                if c_del_col.button(f"🗑️ Delete Staff"):
-                    st.session_state['delete_candidate'] = selected_staff_edit
-                    st.session_state['confirm_delete'] = True
-
                 if st.form_submit_button("Update Staff Info"):
                     update_staff_info(selected_staff_edit, new_role, new_pay_type, new_direct_rate, new_indirect_rate, new_travel, new_password if new_password else None)
                     st.success(f"Updated information for {selected_staff_edit}")
                     st.rerun()
+            
+            # --- DELETE BUTTON (MUST BE OUTSIDE THE FORM) ---
+            st.markdown("---")
+            if st.button(f"🗑️ Delete Staff: {selected_staff_edit}"): # Now a regular button outside the form
+                st.session_state['delete_candidate'] = selected_staff_edit
+                st.session_state['confirm_delete'] = True
                     
-            # Confirmation dialogue (outside the form so the form button doesn't trigger a rerun before confirmation)
+            # Confirmation dialogue (Correctly placed after the form)
             if 'confirm_delete' in st.session_state and st.session_state['confirm_delete'] and st.session_state['delete_candidate'] == selected_staff_edit:
                 st.error(f"⚠️ Are you absolutely sure you want to delete **{selected_staff_edit}**? This action is permanent and will delete ALL associated logs.")
                 col_confirm1, col_confirm2 = st.columns(2)

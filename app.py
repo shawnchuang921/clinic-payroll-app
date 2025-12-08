@@ -28,7 +28,8 @@ def init_db():
                     position TEXT,
                     pay_type TEXT, 
                     base_rate REAL, 
-                    travel_fee REAL
+                    travel_fee REAL,
+                    indirect_rate REAL
                 )''') 
     
     # --- MIGRATION: Check if 'indirect_rate' exists, if not, add it ---
@@ -67,8 +68,8 @@ def init_db():
         
         # Default Configs (base_rate is Direct Rate, indirect_rate is new)
         configs = [
-            ('Leonardo Tam', 'OT', 'Percentage', 50.0, 20.0, 0.0),
-            ('Julia Kwan', 'OT', 'Hourly', 80.0, 20.0, 50.0), # Example: $80 Direct, $50 Indirect
+            ('Leonardo Tam', 'OT', 'Percentage', 50.0, 20.0, 0.0), # $50% Share, $20 Travel
+            ('Julia Kwan', 'OT', 'Hourly', 80.0, 20.0, 50.0), # $80 Direct, $50 Indirect, $20 Travel
             ('Shawn Chuang', 'Admin', 'Hourly', 0.0, 0.0, 0.0)
         ]
         c.executemany("INSERT INTO staff_config (staff_name, position, pay_type, base_rate, travel_fee, indirect_rate) VALUES (?,?,?,?,?,?)", configs)
@@ -93,6 +94,15 @@ def get_all_staff_names():
     df = pd.read_sql_query("SELECT staff_name FROM staff_config", conn)
     conn.close()
     return df['staff_name'].tolist()
+
+def get_log_entry_by_id(log_id):
+    conn = sqlite3.connect('clinic.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM staff_logs WHERE id=?", (log_id,))
+    cols = [desc[0] for desc in c.description]
+    row_data = c.fetchone()
+    conn.close()
+    return dict(zip(cols, row_data)) if row_data else None
 
 def save_log_entry(data):
     conn = sqlite3.connect('clinic.db')
@@ -162,7 +172,24 @@ def get_filtered_logs(staff_filter=None, start_date=None, end_date=None):
     conn.close()
     return df
 
-# --- 2. RECONCILIATION LOGIC ---
+# --- PAY CALCULATION HELPER ---
+
+def calculate_total_pay(config, direct_hrs, indirect_hrs, charged_amount, is_home_session):
+    direct_rate = config['base_rate']
+    indirect_rate = config['indirect_rate']
+    travel_fee_val = config['travel_fee'] if is_home_session else 0.0
+    total_pay = 0.0
+    
+    if config['pay_type'] == 'Hourly':
+        # Formula: (Direct Hrs × Direct Rate) + (Indirect Hrs × Indirect Rate) + Travel Fee
+        total_pay = (direct_hrs * direct_rate) + (indirect_hrs * indirect_rate) + travel_fee_val
+    elif config['pay_type'] == 'Percentage':
+        # Formula: (Charged Amount × Percentage Share) + Travel Fee
+        total_pay = (charged_amount * (direct_rate / 100)) + travel_fee_val
+    
+    return total_pay, travel_fee_val
+
+# --- 2. RECONCILIATION LOGIC (UNCHANGED) ---
 
 def run_reconciliation_logic(df_staff, df_sales):
     # --- HELPER FUNCTIONS ---
@@ -398,26 +425,41 @@ def staff_entry_page():
         st.error("Configuration not found. Please contact Admin.")
         return
 
+    # --- Monthly Pay Estimate (Point 1) ---
+    today = datetime.date.today()
+    first_day_of_month = today.replace(day=1)
+    
+    # Fetch all logs for the current staff in the current month
+    df_monthly = get_filtered_logs(st.session_state['staff_name'], first_day_of_month, today)
+    monthly_pay = df_monthly['total_pay'].sum() if not df_monthly.empty else 0.0
+
+    st.metric(label=f"💰 Estimated Pay for {today.strftime('%B')}", value=f"${monthly_pay:,.2f}")
+    st.markdown("---")
+    
     # Use 'base_rate' from DB as Direct Rate
     direct_rate = config['base_rate']
-    # Use 'indirect_rate' from DB, default to 0.0 if not present (migration handling)
     indirect_rate = config['indirect_rate'] if 'indirect_rate' in config else 0.0
 
     st.info(f"**Position:** {config['position']} | **Pay Type:** {config['pay_type']}")
     if config['pay_type'] == 'Hourly':
-        st.caption(f"Rates: ${direct_rate}/hr (Direct) | ${indirect_rate}/hr (Indirect)")
+        st.caption(f"Rates: ${direct_rate}/hr (Direct) | ${indirect_rate}/hr (Indirect) | Travel Fee: ${config['travel_fee']}")
+    elif config['pay_type'] == 'Percentage':
+        st.caption(f"Rates: {direct_rate}% of Charged Amt | Travel Fee: ${config['travel_fee']}")
+
     
+    # --- New Entry Form ---
+    st.markdown("### 📝 Submit New Entry")
     with st.form("staff_log_form"):
         col1, col2 = st.columns(2)
         date_input = col1.date_input("Date of Service")
         client_name = col2.text_input("Client Name (First Last)")
         col3, col4 = st.columns(2)
-        direct_hrs = col3.number_input("Direct Hours", min_value=0.0, step=0.5)
-        indirect_hrs = col4.number_input("Indirect Hours", min_value=0.0, step=0.5)
+        direct_hrs = col3.number_input("Direct Hours", min_value=0.0, step=0.5, key="new_direct_hrs")
+        indirect_hrs = col4.number_input("Indirect Hours", min_value=0.0, step=0.5, key="new_indirect_hrs")
         
         charged_amount = 0.0
         if config['pay_type'] == 'Percentage':
-            charged_amount = st.number_input("Charged Amount ($)", min_value=0.0, step=10.0)
+            charged_amount = st.number_input("Charged Amount ($)", min_value=0.0, step=10.0, key="new_charged_amt")
         
         is_home_session = st.checkbox("Home Session / Outside Clinic?")
         notes = st.text_area("Notes (Optional)")
@@ -427,16 +469,8 @@ def staff_entry_page():
             if not client_name:
                 st.error("Client Name is required.")
             else:
-                travel_fee_val = config['travel_fee'] if is_home_session else 0.0
+                total_pay, travel_fee_val = calculate_total_pay(config, direct_hrs, indirect_hrs, charged_amount, is_home_session)
                 outside_val = "Yes" if is_home_session else "No"
-                total_pay = 0.0
-                
-                if config['pay_type'] == 'Hourly':
-                    # UPDATED FORMULA: Separate rates for direct and indirect
-                    total_pay = (direct_hrs * direct_rate) + (indirect_hrs * indirect_rate) + travel_fee_val
-                elif config['pay_type'] == 'Percentage':
-                    # base_rate is treated as percentage
-                    total_pay = (charged_amount * (direct_rate / 100)) + travel_fee_val
                 
                 log_data = {
                     'date': date_input.strftime('%Y-%m-%d'), 'staff_name': st.session_state['staff_name'],
@@ -446,16 +480,98 @@ def staff_entry_page():
                 }
                 save_log_entry(log_data)
                 st.success(f"Entry Saved! Total Pay: ${total_pay:.2f}")
+                st.balloons()
+                st.rerun() # Rerun to refresh the monthly total
 
-    st.markdown("### 🕒 Your Recent Entries")
-    df_all = get_filtered_logs(st.session_state['staff_name'])
-    if not df_all.empty:
-        st.dataframe(df_all.sort_values('id', ascending=False).head(5))
+    # --- View & Edit Logs Section (Points 2 & 3) ---
+    st.markdown("### 🔎 View & Edit Your Logs")
+    
+    # Filters (Point 3)
+    col_f1, col_f2, col_f3 = st.columns(3)
+    # Default filter to the last 30 days
+    default_start_date = today - datetime.timedelta(days=30)
+    filter_start_date = col_f1.date_input("Start Date", default_start_date, key="staff_filter_start_date")
+    filter_end_date = col_f2.date_input("End Date", today, key="staff_filter_end_date")
+    client_search = col_f3.text_input("Client Search (Partial Name)", key="client_search")
 
+    # Fetch filtered data
+    df_logs = get_filtered_logs(st.session_state['staff_name'], filter_start_date, filter_end_date)
+
+    # Apply client name filter
+    if client_search:
+        df_logs = df_logs[df_logs['client_name'].str.contains(client_search, case=False, na=False)]
+    
+    if df_logs.empty:
+        st.info("No entries found for the selected criteria.")
+    else:
+        # Display Table
+        st.dataframe(
+            df_logs[['id', 'date', 'client_name', 'direct_hrs', 'indirect_hrs', 'charged_amount', 'outside_clinic', 'total_pay', 'notes']].sort_values('id', ascending=False),
+            use_container_width=True
+        )
+
+        # Edit/Delete Logic (Point 2)
+        st.markdown("#### ✏️ Edit or Delete an Entry")
+        log_id_to_edit = st.number_input("Enter Log ID to Edit (Find in 'id' column above)", min_value=0, step=1, key="staff_log_id_edit")
+        
+        if log_id_to_edit > 0:
+            current_row = get_log_entry_by_id(log_id_to_edit)
+            
+            if current_row and current_row['staff_name'] == st.session_state['staff_name']:
+                
+                st.warning(f"Editing Log ID: {log_id_to_edit} - Client: {current_row['client_name']}")
+                
+                with st.form("edit_log_form"):
+                    col_e1, col_e2 = st.columns(2)
+                    e_date = col_e1.date_input("Date", pd.to_datetime(current_row['date']), key="e_date")
+                    e_client = col_e2.text_input("Client Name", current_row['client_name'], key="e_client")
+                    
+                    col_e3, col_e4 = st.columns(2)
+                    e_direct = col_e3.number_input("Direct Hrs", value=float(current_row['direct_hrs']), min_value=0.0, step=0.5, key="e_direct")
+                    e_indirect = col_e4.number_input("Indirect Hrs", value=float(current_row['indirect_hrs']), min_value=0.0, step=0.5, key="e_indirect")
+                    
+                    e_charged = float(current_row['charged_amount'])
+                    if config['pay_type'] == 'Percentage':
+                        e_charged = st.number_input("Charged Amt", value=float(current_row['charged_amount']), min_value=0.0, step=10.0, key="e_charged")
+                    
+                    e_is_home = (current_row['outside_clinic'] == 'Yes')
+                    e_outside = st.checkbox("Home Session / Outside Clinic?", value=e_is_home, key="e_outside")
+
+                    e_notes = st.text_area("Notes", current_row['notes'], key="e_notes")
+                    
+                    c_del, c_save = st.columns([1, 4])
+                    
+                    if c_del.form_submit_button("DELETE Log"):
+                        delete_log_entry(log_id_to_edit)
+                        st.warning(f"Log {log_id_to_edit} Deleted.")
+                        st.rerun()
+                        
+                    if c_save.form_submit_button("Update Log"):
+                        
+                        # Recalculate total pay based on potentially updated hours/charged amount
+                        recalculated_pay, recalculated_travel = calculate_total_pay(
+                            config, e_direct, e_indirect, e_charged, e_outside
+                        )
+
+                        updated_data = {
+                            'date': e_date.strftime('%Y-%m-%d'), 'client_name': e_client,
+                            'direct_hrs': e_direct, 'indirect_hrs': e_indirect,
+                            'charged_amount': e_charged, 'outside_clinic': "Yes" if e_outside else "No",
+                            'travel_fee_used': recalculated_travel, 'total_pay': recalculated_pay, 'notes': e_notes
+                        }
+                        update_log_entry(log_id_to_edit, updated_data)
+                        st.success(f"Log updated successfully! New Total Pay: ${recalculated_pay:.2f}")
+                        st.rerun()
+
+            elif current_row:
+                 st.error("You are not authorized to edit this entry.")
+            else:
+                st.warning("Log ID not found.")
+                
 def admin_page():
     st.markdown(f"## 🛠️ Admin Dashboard ({st.session_state['staff_name']})")
     
-    tab1, tab2, tab3 = st.tabs(["📊 Reconciliation", "👥 Manage Staff & Passwords", "📝 View & Edit Logs"])
+    tab1, tab2, tab3 = st.tabs(["📊 Reconciliation", "👥 Manage Staff & Passwords", "📝 View & Edit Logs (Admin)"])
     
     with tab1:
         st.subheader("Run Payroll Reconciliation")
@@ -507,7 +623,7 @@ def admin_page():
                         c1.metric("Matches", h_m)
                         c2.metric("Critical Errors", h_e)
                         c3.metric("Staff Only", h_so)
-                        c4.metric("Sales Only", h_sro)
+                        c4.metric("Sales Only", p_sro)
                         
                         st.markdown("#### Percentage Staff Summary")
                         c1, c2, c3, c4 = st.columns(4)
@@ -559,58 +675,67 @@ def admin_page():
                     st.rerun()
 
     with tab3:
-        st.subheader("View & Edit Staff Logs")
+        st.subheader("View & Edit Staff Logs (Admin Access)")
         
         col1, col2 = st.columns(2)
-        filter_staff = col1.selectbox("Filter by Staff", ["All Staff"] + get_all_staff_names(), key="log_filter_staff")
-        filter_date = col2.date_input("Filter by Date (Start)", datetime.date.today() - datetime.timedelta(days=30))
+        filter_staff = col1.selectbox("Filter by Staff", ["All Staff"] + get_all_staff_names(), key="admin_log_filter_staff")
+        filter_date = col2.date_input("Filter by Date (Start)", datetime.date.today() - datetime.timedelta(days=30), key="admin_log_filter_date")
         
         df_logs = get_filtered_logs(filter_staff, filter_date, datetime.date.today() + datetime.timedelta(days=1))
         st.dataframe(df_logs)
         
         st.markdown("### ✏️ Edit a Log Entry")
-        log_id_to_edit = st.number_input("Enter Log ID to Edit (See 'id' column above)", min_value=0, step=1)
+        log_id_to_edit = st.number_input("Enter Log ID to Edit (See 'id' column above)", min_value=0, step=1, key="admin_log_id_edit")
         
         if log_id_to_edit > 0:
-            if log_id_to_edit in df_logs['id'].values:
-                current_row = df_logs[df_logs['id'] == log_id_to_edit].iloc[0]
+            current_row = get_log_entry_by_id(log_id_to_edit)
+            
+            if current_row:
+                staff_config_for_edit = get_staff_config(current_row['staff_name'])
                 
-                with st.form("edit_log_form"):
-                    col1, col2 = st.columns(2)
-                    e_date = col1.date_input("Date", pd.to_datetime(current_row['date']))
-                    e_client = col2.text_input("Client Name", current_row['client_name'])
+                with st.form("admin_edit_log_form"):
+                    st.info(f"Editing entry for: **{current_row['staff_name']}**")
+                    col_a1, col_a2 = st.columns(2)
+                    e_date = col_a1.date_input("Date", pd.to_datetime(current_row['date']), key="a_e_date")
+                    e_client = col_a2.text_input("Client Name", current_row['client_name'], key="a_e_client")
                     
-                    col3, col4 = st.columns(2)
-                    e_direct = col3.number_input("Direct Hrs", value=float(current_row['direct_hrs']))
-                    e_indirect = col4.number_input("Indirect Hrs", value=float(current_row['indirect_hrs']))
+                    col_a3, col_a4 = st.columns(2)
+                    e_direct = col_a3.number_input("Direct Hrs", value=float(current_row['direct_hrs']), min_value=0.0, step=0.5, key="a_e_direct")
+                    e_indirect = col_a4.number_input("Indirect Hrs", value=float(current_row['indirect_hrs']), min_value=0.0, step=0.5, key="a_e_indirect")
                     
-                    col5, col6 = st.columns(2)
-                    e_charged = col5.number_input("Charged Amt", value=float(current_row['charged_amount']))
-                    e_travel = col6.number_input("Travel Fee Used", value=float(current_row['travel_fee_used']))
+                    e_charged = float(current_row['charged_amount'])
+                    if staff_config_for_edit['pay_type'] == 'Percentage':
+                        e_charged = st.number_input("Charged Amt", value=float(current_row['charged_amount']), min_value=0.0, step=10.0, key="a_e_charged")
                     
-                    e_outside = st.selectbox("Outside Clinic?", ["Yes", "No"], index=0 if current_row['outside_clinic']=='Yes' else 1)
-                    e_notes = st.text_area("Notes", current_row['notes'])
+                    e_is_home = (current_row['outside_clinic'] == 'Yes')
+                    e_outside = st.checkbox("Outside Clinic?", value=e_is_home, key="a_e_outside")
                     
-                    e_total = st.number_input("Total Pay (Override if needed)", value=float(current_row['total_pay']))
+                    e_notes = st.text_area("Notes", current_row['notes'], key="a_e_notes")
+                    
+                    # Recalculate total pay
+                    recalculated_pay, recalculated_travel = calculate_total_pay(
+                        staff_config_for_edit, e_direct, e_indirect, e_charged, e_outside
+                    )
+                    st.write(f"**Recalculated Total Pay:** ${recalculated_pay:.2f} (Travel: ${recalculated_travel:.2f})")
                     
                     c_del, c_save = st.columns([1, 4])
-                    if c_del.form_submit_button("DELETE Log"):
+                    if c_del.form_submit_button("DELETE Log (Admin)"):
                         delete_log_entry(log_id_to_edit)
                         st.warning(f"Log {log_id_to_edit} Deleted.")
                         st.rerun()
                         
-                    if c_save.form_submit_button("Update Log"):
+                    if c_save.form_submit_button("Update Log (Admin)"):
                         updated_data = {
                             'date': e_date.strftime('%Y-%m-%d'), 'client_name': e_client,
                             'direct_hrs': e_direct, 'indirect_hrs': e_indirect,
-                            'charged_amount': e_charged, 'outside_clinic': e_outside,
-                            'travel_fee_used': e_travel, 'total_pay': e_total, 'notes': e_notes
+                            'charged_amount': e_charged, 'outside_clinic': "Yes" if e_outside else "No",
+                            'travel_fee_used': recalculated_travel, 'total_pay': recalculated_pay, 'notes': e_notes
                         }
                         update_log_entry(log_id_to_edit, updated_data)
                         st.success("Log updated successfully!")
                         st.rerun()
             else:
-                st.warning("Log ID not found in the current filtered view.")
+                st.warning("Log ID not found.")
 
 # --- 4. APP ENTRY POINT ---
 

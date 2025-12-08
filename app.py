@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import datetime
 import re
 import io
+import datetime
 from difflib import SequenceMatcher
 
 # --- 1. DATABASE SETUP & MANAGEMENT ---
@@ -28,7 +28,7 @@ def init_db():
                     pay_type TEXT, 
                     base_rate REAL,
                     travel_fee REAL
-                )''') # pay_type: 'Hourly' or 'Percentage'
+                )''') 
     
     # Table: Staff Logs (The actual entries)
     c.execute('''CREATE TABLE IF NOT EXISTS staff_logs (
@@ -49,7 +49,6 @@ def init_db():
     # --- SEED DATA (Only runs if empty) ---
     c.execute("SELECT count(*) FROM users")
     if c.fetchone()[0] == 0:
-        # Default Users
         users = [
             ('shawn', 'admin123', 'admin', 'Shawn Chuang'),
             ('leo', 'staff123', 'staff', 'Leonardo Tam'),
@@ -57,21 +56,32 @@ def init_db():
         ]
         c.executemany("INSERT INTO users VALUES (?,?,?,?)", users)
         
-        # Default Staff Config
         configs = [
-            ('Leonardo Tam', 'OT', 'Percentage', 50.0, 20.0), # 50% split, $20 travel
-            ('Julia Kwan', 'OT', 'Hourly', 80.0, 20.0),       # $80/hr, $20 travel
+            ('Leonardo Tam', 'OT', 'Percentage', 50.0, 20.0),
+            ('Julia Kwan', 'OT', 'Hourly', 80.0, 20.0),
             ('Shawn Chuang', 'Admin', 'Hourly', 0.0, 0.0)
         ]
         c.executemany("INSERT INTO staff_config VALUES (?,?,?,?,?)", configs)
-        
         conn.commit()
-    
     conn.close()
+
+# --- DB Access Helpers ---
 
 def get_staff_config(staff_name):
     conn = sqlite3.connect('clinic.db')
     df = pd.read_sql_query("SELECT * FROM staff_config WHERE staff_name = ?", conn, params=(staff_name,))
+    conn.close()
+    return df.iloc[0] if not df.empty else None
+
+def get_all_staff_names():
+    conn = sqlite3.connect('clinic.db')
+    df = pd.read_sql_query("SELECT staff_name FROM staff_config", conn)
+    conn.close()
+    return df['staff_name'].tolist()
+
+def get_user_info(staff_name):
+    conn = sqlite3.connect('clinic.db')
+    df = pd.read_sql_query("SELECT * FROM users WHERE staff_name = ?", conn, params=(staff_name,))
     conn.close()
     return df.iloc[0] if not df.empty else None
 
@@ -87,28 +97,81 @@ def save_log_entry(data):
     conn.commit()
     conn.close()
 
-def get_all_logs():
+def update_log_entry(log_id, data):
     conn = sqlite3.connect('clinic.db')
-    df = pd.read_sql_query("SELECT * FROM staff_logs", conn)
+    c = conn.cursor()
+    c.execute('''UPDATE staff_logs SET 
+                 date=?, client_name=?, direct_hrs=?, indirect_hrs=?, 
+                 charged_amount=?, outside_clinic=?, travel_fee_used=?, total_pay=?, notes=?
+                 WHERE id=?''', 
+              (data['date'], data['client_name'], data['direct_hrs'], 
+               data['indirect_hrs'], data['charged_amount'], data['outside_clinic'], 
+               data['travel_fee_used'], data['total_pay'], data['notes'], log_id))
+    conn.commit()
+    conn.close()
+
+def delete_log_entry(log_id):
+    conn = sqlite3.connect('clinic.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM staff_logs WHERE id=?", (log_id,))
+    conn.commit()
+    conn.close()
+
+def update_staff_info(original_name, new_role, new_pay_type, new_rate, new_travel, new_password=None):
+    conn = sqlite3.connect('clinic.db')
+    c = conn.cursor()
+    # Update Config
+    c.execute('''UPDATE staff_config SET 
+                 position=?, pay_type=?, base_rate=?, travel_fee=?
+                 WHERE staff_name=?''', 
+              (new_role, new_pay_type, new_rate, new_travel, original_name))
+    
+    # Update Password if provided
+    if new_password:
+        c.execute("UPDATE users SET password=? WHERE staff_name=?", (new_password, original_name))
+    
+    conn.commit()
+    conn.close()
+
+def get_filtered_logs(staff_filter=None, start_date=None, end_date=None):
+    conn = sqlite3.connect('clinic.db')
+    query = "SELECT * FROM staff_logs WHERE 1=1"
+    params = []
+    
+    if staff_filter and staff_filter != "All Staff":
+        query += " AND staff_name = ?"
+        params.append(staff_filter)
+    
+    if start_date:
+        query += " AND date >= ?"
+        params.append(str(start_date))
+    
+    if end_date:
+        query += " AND date <= ?"
+        params.append(str(end_date))
+        
+    df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return df
 
-# --- 2. RECONCILIATION LOGIC (Your Perfected Engine) ---
+# --- 2. RECONCILIATION LOGIC ---
 
 def run_reconciliation_logic(df_staff, df_sales):
-    # --- HELPER FUNCTIONS FOR RECONCILIATION ---
+    # --- HELPER FUNCTIONS ---
     def clean_name_string(name):
         if not isinstance(name, str): return ""
         return re.sub(r'[^a-z]', '', name.lower())
 
     def extract_name(note):
         if not isinstance(note, str): return ""
+        # Try capturing Name at start
         pattern = r'^(.*?)\s+\d{1,2}(?::\d{2})?-\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)?.*$'
         match = re.search(pattern, note, flags=re.IGNORECASE)
         if match:
             extracted = match.group(1).strip()
             extracted = re.sub(r'\s+(OT|PT|SLP|Assessment|Intervention|Report|Consultation|Session|Writing)\s*$', '', extracted, flags=re.IGNORECASE)
             return extracted.strip()
+        # Fallback
         pattern = r'\s+\d{1,2}(?::\d{2})?-\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)?.*$'
         clean_name = re.sub(pattern, '', note, flags=re.IGNORECASE)
         return clean_name.strip()
@@ -173,7 +236,7 @@ def run_reconciliation_logic(df_staff, df_sales):
     # 1. Prepare Staff Data (Already loaded from DB, just clean columns)
     df_staff.columns = df_staff.columns.str.strip().str.replace(' ', '_').str.lower()
     
-    # Get Pay Types from DB Config (re-using db logic inside here for simplicity of the flow)
+    # Get Pay Types from DB Config
     conn = sqlite3.connect('clinic.db')
     df_config = pd.read_sql_query("SELECT staff_name, pay_type FROM staff_config", conn)
     conn.close()
@@ -201,7 +264,7 @@ def run_reconciliation_logic(df_staff, df_sales):
     # 3. Staff Data Prep
     df_staff['date_obj'] = pd.to_datetime(df_staff['date'], errors='coerce')
     df_staff['date_str'] = df_staff['date_obj'].dt.normalize().astype(str).str[:10]
-    df_staff['extracted_name'] = df_staff['client_name'] # Using client_name from form directly
+    df_staff['extracted_name'] = df_staff['client_name'] 
     df_staff['name_norm'] = df_staff['extracted_name'].apply(clean_name_string)
     df_staff['travel_fee_used'] = pd.to_numeric(df_staff['travel_fee_used'], errors='coerce').fillna(0)
     df_staff['charged_amount'] = pd.to_numeric(df_staff['charged_amount'], errors='coerce').fillna(0)
@@ -241,7 +304,7 @@ def run_reconciliation_logic(df_staff, df_sales):
             match_dict = row.to_dict()
             match_dict['Status'] = 'Matched'
             match_dict['Match_Type'] = f"Match (Diff: {row['date_diff']} days)"
-            match_dict['Staff_Name_Final'] = row['staff_name'] # From Staff Log
+            match_dict['Staff_Name_Final'] = row['staff_name'] 
             final_rows.append(match_dict)
             matched_staff_ids.add(sid)
             matched_sales_ids.add(slid)
@@ -303,10 +366,9 @@ def login_page():
 def staff_entry_page():
     st.markdown(f"## 👋 Welcome, {st.session_state['staff_name']}")
     
-    # Fetch Config
     config = get_staff_config(st.session_state['staff_name'])
     if config is None:
-        st.error("Configuration not found for this staff member. Please contact Admin.")
+        st.error("Configuration not found. Please contact Admin.")
         return
 
     st.info(f"**Position:** {config['position']} | **Pay Structure:** {config['pay_type']}")
@@ -315,180 +377,221 @@ def staff_entry_page():
         col1, col2 = st.columns(2)
         date_input = col1.date_input("Date of Service")
         client_name = col2.text_input("Client Name (First Last)")
-        
         col3, col4 = st.columns(2)
         direct_hrs = col3.number_input("Direct Hours", min_value=0.0, step=0.5)
         indirect_hrs = col4.number_input("Indirect Hours", min_value=0.0, step=0.5)
         
-        # Dynamic Fields based on Pay Type
         charged_amount = 0.0
         if config['pay_type'] == 'Percentage':
             charged_amount = st.number_input("Charged Amount ($)", min_value=0.0, step=10.0)
         
-        # Travel Fee Logic
         is_home_session = st.checkbox("Home Session / Outside Clinic?")
-        
         notes = st.text_area("Notes (Optional)")
-        
         submitted = st.form_submit_button("Submit Entry")
         
         if submitted:
             if not client_name:
                 st.error("Client Name is required.")
             else:
-                # Calculate Pay Logic
                 travel_fee_val = config['travel_fee'] if is_home_session else 0.0
                 outside_val = "Yes" if is_home_session else "No"
                 total_pay = 0.0
-                
                 if config['pay_type'] == 'Hourly':
-                    # (Direct + Indirect) * Base Rate + Travel Fee
                     total_pay = ((direct_hrs + indirect_hrs) * config['base_rate']) + travel_fee_val
                 elif config['pay_type'] == 'Percentage':
-                    # (Percentage * Charged Amount) + Travel Fee
-                    # Base rate is treated as percentage (e.g., 50.0 for 50%)
                     total_pay = (charged_amount * (config['base_rate'] / 100)) + travel_fee_val
                 
                 log_data = {
-                    'date': date_input.strftime('%Y-%m-%d'),
-                    'staff_name': st.session_state['staff_name'],
-                    'client_name': client_name,
-                    'direct_hrs': direct_hrs,
-                    'indirect_hrs': indirect_hrs,
-                    'charged_amount': charged_amount,
-                    'outside_clinic': outside_val,
-                    'travel_fee_used': travel_fee_val,
-                    'total_pay': total_pay,
-                    'notes': f"{client_name} {notes}"
+                    'date': date_input.strftime('%Y-%m-%d'), 'staff_name': st.session_state['staff_name'],
+                    'client_name': client_name, 'direct_hrs': direct_hrs, 'indirect_hrs': indirect_hrs,
+                    'charged_amount': charged_amount, 'outside_clinic': outside_val,
+                    'travel_fee_used': travel_fee_val, 'total_pay': total_pay, 'notes': f"{client_name} {notes}"
                 }
-                
                 save_log_entry(log_data)
-                st.success(f"Entry Saved! Total Pay calculated: ${total_pay:.2f}")
+                st.success(f"Entry Saved! Total Pay: ${total_pay:.2f}")
 
     st.markdown("### 🕒 Your Recent Entries")
-    df_all = get_all_logs()
+    df_all = get_filtered_logs(st.session_state['staff_name'])
     if not df_all.empty:
-        my_logs = df_all[df_all['staff_name'] == st.session_state['staff_name']].sort_values('id', ascending=False).head(5)
-        st.dataframe(my_logs[['date', 'client_name', 'direct_hrs', 'total_pay', 'outside_clinic']])
+        st.dataframe(df_all.sort_values('id', ascending=False).head(5))
 
 def admin_page():
     st.markdown(f"## 🛠️ Admin Dashboard ({st.session_state['staff_name']})")
     
-    tab1, tab2, tab3 = st.tabs(["📊 Reconciliation", "👥 Staff Management", "📝 View All Logs"])
+    tab1, tab2, tab3 = st.tabs(["📊 Reconciliation", "👥 Manage Staff & Passwords", "📝 View & Edit Logs"])
     
     with tab1:
         st.subheader("Run Payroll Reconciliation")
-        st.markdown("This uses the live data from the Staff Logs database.")
+        
+        # --- Scoped Reconciliation Filters ---
+        col1, col2 = st.columns(2)
+        all_staff = ["All Staff"] + get_all_staff_names()
+        selected_staff = col1.selectbox("Filter by Staff", all_staff)
+        
+        col3, col4 = col2.columns(2)
+        start_date = col3.date_input("Start Date", datetime.date.today().replace(day=1))
+        end_date = col4.date_input("End Date", datetime.date.today())
         
         sales_file = st.file_uploader("Upload Sales Record (CSV)", type=['csv'])
         
-        if st.button("Run Reconciliation") and sales_file:
-            # 1. Get Staff Data from DB
-            df_staff_db = get_all_logs()
-            
-            if df_staff_db.empty:
-                st.warning("No staff logs found in database.")
+        if st.button("Run Reconciliation"):
+            if not sales_file:
+                st.error("Please upload a Sales Record CSV.")
             else:
-                # 2. Get Sales Data
-                try:
-                    df_sales_csv = pd.read_csv(sales_file, encoding='latin1', engine='python', on_bad_lines='skip')
-                    
-                    # 3. Run Logic
-                    final_report = run_reconciliation_logic(df_staff_db, df_sales_csv)
-                    
-                    # 4. Display Results (Metrics Logic Copied from previous success)
-                    df_hourly = final_report[final_report['Pay_Type'] == 'Hourly']
-                    df_percentage = final_report[final_report['Pay_Type'] == 'Percentage']
-                    
-                    def get_metrics(df, ptype):
-                        matched = len(df[df['Status'] == 'Matched'])
-                        staff_only = len(df[df['Status'].str.contains('Staff Log Only')])
-                        sales_only = len(df[df['Status'].str.contains('Sales Record Only')])
-                        err = 0
-                        if ptype == 'Hourly':
-                            h_err = len(df[(df['Status']=='Matched') & (df['Hours_Validation_Status'].str.startswith('Mismatch'))])
-                            amt_err = len(df[(df['Status']=='Matched') & (df['Amount_Status'].str.contains('Mismatch')) & (df['Amount_Status'].str.contains('Travel Fee'))])
-                            err = h_err + amt_err
-                        else:
-                            err = len(df[(df['Status']=='Matched') & (df['Amount_Status'].str.contains('Mismatch'))])
-                        return matched, err, staff_only, sales_only
+                # 1. Get Staff Data from DB with Filters
+                df_staff_db = get_filtered_logs(selected_staff, start_date, end_date)
+                
+                if df_staff_db.empty:
+                    st.warning("No staff logs found for the selected criteria.")
+                else:
+                    try:
+                        df_sales_csv = pd.read_csv(sales_file, encoding='latin1', engine='python', on_bad_lines='skip')
+                        final_report = run_reconciliation_logic(df_staff_db, df_sales_csv)
+                        
+                        # --- METRICS ---
+                        df_hourly = final_report[final_report['Pay_Type'] == 'Hourly']
+                        df_percentage = final_report[final_report['Pay_Type'] == 'Percentage']
+                        
+                        def get_metrics(df, ptype):
+                            matched = len(df[df['Status'] == 'Matched'])
+                            staff_only = len(df[df['Status'].str.contains('Staff Log Only', na=False)])
+                            sales_only = len(df[df['Status'].str.contains('Sales Record Only', na=False)])
+                            err = 0
+                            if ptype == 'Hourly':
+                                h_err = len(df[(df['Status']=='Matched') & (df['Hours_Validation_Status'].str.startswith('Mismatch'))])
+                                amt_err = len(df[(df['Status']=='Matched') & (df['Amount_Status'].str.contains('Mismatch')) & (df['Amount_Status'].str.contains('Travel Fee'))])
+                                err = h_err + amt_err
+                            else:
+                                err = len(df[(df['Status']=='Matched') & (df['Amount_Status'].str.contains('Mismatch'))])
+                            return matched, err, staff_only, sales_only
 
-                    h_m, h_e, h_so, h_sro = get_metrics(df_hourly, 'Hourly')
-                    p_m, p_e, p_so, p_sro = get_metrics(df_percentage, 'Percentage')
-                    
-                    st.markdown("#### Hourly Rate Staff Summary")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Matches", h_m)
-                    c2.metric("Critical Errors", h_e)
-                    c3.metric("Staff Only", h_so)
-                    c4.metric("Sales Only", h_sro)
-                    
-                    st.markdown("#### Percentage Staff Summary")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Matches", p_m)
-                    c2.metric("Amount Errors", p_e)
-                    c3.metric("Staff Only", p_so)
-                    c4.metric("Sales Only", p_sro)
-                    
-                    st.dataframe(final_report)
-                    
-                    csv = final_report.to_csv(index=False).encode('utf-8')
-                    st.download_button("Download Report", csv, "Reconciliation_Report.csv", "text/csv")
-                    
-                except Exception as e:
-                    st.error(f"Error processing files: {e}")
+                        h_m, h_e, h_so, h_sro = get_metrics(df_hourly, 'Hourly')
+                        p_m, p_e, p_so, p_sro = get_metrics(df_percentage, 'Percentage')
+                        
+                        st.markdown("#### Hourly Rate Staff Summary")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Matches", h_m)
+                        c2.metric("Critical Errors", h_e)
+                        c3.metric("Staff Only", h_so)
+                        c4.metric("Sales Only", h_sro)
+                        
+                        st.markdown("#### Percentage Staff Summary")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Matches", p_m)
+                        c2.metric("Amount Errors", p_e)
+                        c3.metric("Staff Only", p_so)
+                        c4.metric("Sales Only", p_sro)
+                        
+                        st.dataframe(final_report)
+                        csv = final_report.to_csv(index=False).encode('utf-8')
+                        st.download_button("Download Report", csv, "Reconciliation_Report.csv", "text/csv")
+                        
+                    except Exception as e:
+                        st.error(f"Error processing files: {e}")
 
     with tab2:
-        st.subheader("Manage Staff Rates")
-        conn = sqlite3.connect('clinic.db')
-        df_config = pd.read_sql_query("SELECT * FROM staff_config", conn)
-        st.dataframe(df_config)
+        st.subheader("Manage Staff Information")
+        st.markdown("Edit positions, rates, and **reset passwords** here.")
         
-        with st.expander("Add / Update Staff Member"):
-            with st.form("add_staff"):
-                s_name = st.text_input("Staff Name (Full Name)")
-                s_role = st.text_input("Position (e.g. OT)")
-                s_type = st.selectbox("Pay Type", ["Hourly", "Percentage"])
-                s_rate = st.number_input("Base Rate (or %)", min_value=0.0)
-                s_trav = st.number_input("Travel Fee ($)", value=20.0)
-                if st.form_submit_button("Save"):
-                    c = conn.cursor()
-                    c.execute("REPLACE INTO staff_config VALUES (?,?,?,?,?)", (s_name, s_role, s_type, s_rate, s_trav))
-                    
-                    # Also ensure they have a user login
-                    username = s_name.split()[0].lower()
-                    c.execute("INSERT OR IGNORE INTO users VALUES (?,?,?,?)", (username, 'staff123', 'staff', s_name))
-                    
-                    conn.commit()
-                    st.success(f"Saved {s_name} (User: {username} / Pass: staff123)")
+        staff_list = get_all_staff_names()
+        selected_staff_edit = st.selectbox("Select Staff to Edit", ["Select..."] + staff_list)
+        
+        if selected_staff_edit != "Select...":
+            config = get_staff_config(selected_staff_edit)
+            
+            with st.form("edit_staff_form"):
+                c1, c2 = st.columns(2)
+                new_role = c1.text_input("Position", value=config['position'])
+                new_pay_type = c2.selectbox("Pay Type", ["Hourly", "Percentage"], index=0 if config['pay_type']=='Hourly' else 1)
+                
+                c3, c4 = st.columns(2)
+                new_rate = c3.number_input("Base Rate (or %)", value=config['base_rate'])
+                new_travel = c4.number_input("Travel Fee ($)", value=config['travel_fee'])
+                
+                st.markdown("---")
+                st.markdown("**🔐 Security**")
+                new_password = st.text_input("New Password (leave blank to keep current)", type="password")
+                
+                if st.form_submit_button("Update Staff Info"):
+                    update_staff_info(selected_staff_edit, new_role, new_pay_type, new_rate, new_travel, new_password if new_password else None)
+                    st.success(f"Updated information for {selected_staff_edit}")
                     st.rerun()
-        conn.close()
 
     with tab3:
-        st.subheader("Raw Staff Logs")
-        df_logs = get_all_logs()
+        st.subheader("View & Edit Staff Logs")
+        
+        # --- Filters for Editing ---
+        col1, col2 = st.columns(2)
+        filter_staff = col1.selectbox("Filter by Staff", ["All Staff"] + get_all_staff_names(), key="log_filter_staff")
+        filter_date = col2.date_input("Filter by Date (Start)", datetime.date.today() - datetime.timedelta(days=30))
+        
+        df_logs = get_filtered_logs(filter_staff, filter_date, datetime.date.today() + datetime.timedelta(days=1))
         st.dataframe(df_logs)
-        csv_logs = df_logs.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Raw Logs", csv_logs, "All_Staff_Logs.csv", "text/csv")
+        
+        st.markdown("### ✏️ Edit a Log Entry")
+        log_id_to_edit = st.number_input("Enter Log ID to Edit (See 'id' column above)", min_value=0, step=1)
+        
+        if log_id_to_edit > 0:
+            # Check if valid ID
+            if log_id_to_edit in df_logs['id'].values:
+                # Get current values
+                current_row = df_logs[df_logs['id'] == log_id_to_edit].iloc[0]
+                
+                with st.form("edit_log_form"):
+                    col1, col2 = st.columns(2)
+                    e_date = col1.date_input("Date", pd.to_datetime(current_row['date']))
+                    e_client = col2.text_input("Client Name", current_row['client_name'])
+                    
+                    col3, col4 = st.columns(2)
+                    e_direct = col3.number_input("Direct Hrs", value=float(current_row['direct_hrs']))
+                    e_indirect = col4.number_input("Indirect Hrs", value=float(current_row['indirect_hrs']))
+                    
+                    col5, col6 = st.columns(2)
+                    e_charged = col5.number_input("Charged Amt", value=float(current_row['charged_amount']))
+                    e_travel = col6.number_input("Travel Fee Used", value=float(current_row['travel_fee_used']))
+                    
+                    e_outside = st.selectbox("Outside Clinic?", ["Yes", "No"], index=0 if current_row['outside_clinic']=='Yes' else 1)
+                    e_notes = st.text_area("Notes", current_row['notes'])
+                    
+                    # Recalc total pay helper
+                    # (Simple calc logic for edit - ideally fetch rate but assuming manual override allowed)
+                    e_total = st.number_input("Total Pay (Override if needed)", value=float(current_row['total_pay']))
+                    
+                    c_del, c_save = st.columns([1, 4])
+                    if c_del.form_submit_button("DELETE Log"):
+                        delete_log_entry(log_id_to_edit)
+                        st.warning(f"Log {log_id_to_edit} Deleted.")
+                        st.rerun()
+                        
+                    if c_save.form_submit_button("Update Log"):
+                        updated_data = {
+                            'date': e_date.strftime('%Y-%m-%d'), 'client_name': e_client,
+                            'direct_hrs': e_direct, 'indirect_hrs': e_indirect,
+                            'charged_amount': e_charged, 'outside_clinic': e_outside,
+                            'travel_fee_used': e_travel, 'total_pay': e_total, 'notes': e_notes
+                        }
+                        update_log_entry(log_id_to_edit, updated_data)
+                        st.success("Log updated successfully!")
+                        st.rerun()
+            else:
+                st.warning("Log ID not found in the current filtered view.")
 
 # --- 4. APP ENTRY POINT ---
 
-# Initialize DB on first run
 init_db()
 
-# Check Login State
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
 
 if not st.session_state['logged_in']:
     login_page()
 else:
-    # Logout Button in Sidebar
-    if st.sidebar.button("Logout"):
-        st.session_state['logged_in'] = False
-        st.rerun()
+    with st.sidebar:
+        st.write(f"Logged in as: **{st.session_state['staff_name']}**")
+        if st.button("Logout"):
+            st.session_state['logged_in'] = False
+            st.rerun()
     
-    # Route based on Role
     if st.session_state['user_role'] == 'admin':
         admin_page()
     else:
